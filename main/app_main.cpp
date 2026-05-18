@@ -1328,6 +1328,8 @@ static void auto_update_task(void *arg)
     }
 }
 
+static bool matter_is_ready();  // defined below; used by self_test_task
+
 // Self-test: a freshly OTA-installed image is considered healthy when (a) we
 // have an STA IP (or AP credentials at minimum) and (b) the Matter stack is
 // running. On success we clear the probation marker — the image is permanent.
