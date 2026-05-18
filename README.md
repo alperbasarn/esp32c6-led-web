@@ -81,19 +81,48 @@ This OTA path updates the application partition only. Bootloader and partition t
 
 ## Published auto-updates
 
-The firmware can watch the latest GitHub release for this repository and install a newer published build automatically once the device has normal Wi-Fi access.
+The firmware watches the latest GitHub release for this repository (set via `CONFIG_APP_RELEASE_REPO`, default `alperbasarn/esp32c6-led-web`) and installs newer published builds once the device has Wi-Fi access.
 
-To use it:
+Each release publishes a signed `manifest.json` to the GitHub release. The device:
 
-1. Flash or OTA-install firmware `1.3` or newer once.
-2. Leave `Auto Update From Published Release` enabled in the `Configuration` tab.
-3. Push the latest code to `main`.
-4. Publish a GitHub release with a version tag higher than the device firmware version, such as `v1.4`.
-5. Wait for the `Publish Firmware` GitHub Actions workflow to finish building and attach `esp32c6_led_web.bin` to that release.
+1. Fetches `https://github.com/<repo>/releases/latest/download/manifest.json`.
+2. Fetches `manifest.json.sig` (detached ECDSA P-256 DER signature over the manifest bytes).
+3. Verifies the signature against the public key embedded in [`main/include/release_pubkey.h`](main/include/release_pubkey.h). Rejects the release if the signature is missing or invalid.
+4. Compares `manifest.version` against the running firmware. Skips if not newer.
+5. Cohort-gates: a stable hash of the device MAC % 100 must be less than `manifest.rollout.percent`. Devices outside the cohort surface an "available, waiting" status without installing.
+6. Downloads the binary via `esp_https_ota`, then reads the freshly written OTA partition back and compares its SHA-256 against `manifest.app.sha256`. On mismatch the boot partition is reverted before reboot.
+7. After reboot, a self-test task waits for Wi-Fi STA + the HTTP server to come up within `CONFIG_APP_UPDATE_SELF_TEST_TIMEOUT_S` and calls `esp_ota_mark_app_valid_cancel_rollback()`. If the deadline passes, the device rolls back automatically.
 
-The device checks periodically after it has a station IP, and you can also trigger an immediate check from the web UI with `Check Published Update Now`.
+Each device's first poll is jittered randomly in `[0, CONFIG_APP_UPDATE_INITIAL_JITTER_MIN]` minutes after Wi-Fi up. The manual "Check Published Update Now" button bypasses the jitter.
 
-The release workflow is pinned to the `esp-matter` revision that this project currently builds with. If you intentionally upgrade the Matter stack later, update `ESP_MATTER_REF` in `.github/workflows/publish-firmware.yml` too so GitHub release builds match local builds.
+### Publishing a release
+
+1. Tag and publish a release on GitHub (`gh release create v1.5.0 --generate-notes`).
+2. The `Publish Firmware` workflow builds the app, then runs [`scripts/generate-manifest.sh`](scripts/generate-manifest.sh) which produces `manifest.json` + `manifest.json.sig` and uploads:
+   - `esp32c6_led_web.bin` — the OTA application image
+   - `bootloader.bin`, `partition-table.bin` — needed for first-time USB flashes
+   - `manifest.json`, `manifest.json.sig` — what devices read
+
+The workflow is pinned to the `esp-matter` revision in `ESP_MATTER_REF`. If you upgrade the Matter stack, bump that env in [`.github/workflows/publish-firmware.yml`](.github/workflows/publish-firmware.yml) so CI matches local builds.
+
+### Signing key management
+
+The release manifest is signed by `scripts/generate-manifest.sh` using an ECDSA P-256 private key passed via the `MANIFEST_SIGNING_KEY` repository secret. The matching public key is embedded in firmware at [`main/include/release_pubkey.h`](main/include/release_pubkey.h).
+
+To rotate keys:
+
+```bash
+openssl ecparam -name prime256v1 -genkey -noout -out manifest-signing.key
+openssl ec -in manifest-signing.key -pubout -outform PEM > release_pubkey.pem
+# 1. Paste release_pubkey.pem into kReleasePubKeyPem in main/include/release_pubkey.h
+# 2. Commit, build, and roll out the firmware update so devices learn the new pubkey
+# 3. Only AFTER devices have updated, replace the MANIFEST_SIGNING_KEY secret with the new private key
+# 4. Cut the next release with the new key
+```
+
+Devices that have not yet picked up the new public-key firmware will refuse manifests signed by the new private key. Plan the rotation in two release waves.
+
+To bootstrap a fresh fork: generate a new keypair as above, replace the placeholder PEM in `main/include/release_pubkey.h`, add `MANIFEST_SIGNING_KEY` (contents of `manifest-signing.key`) as a repo secret. Never commit the private key.
 
 ## Reset options
 

@@ -23,6 +23,8 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_ota_ops.h"
+#include "esp_partition.h"
+#include "esp_random.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
@@ -30,8 +32,12 @@
 #include "freertos/task.h"
 #include "led_strip.h"
 #include "lwip/inet.h"
+#include "mbedtls/pk.h"
+#include "mbedtls/sha256.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+
+#include "release_pubkey.h"
 
 #include <app/server/CommissioningWindowManager.h>
 #include <app/server/Server.h>
@@ -64,10 +70,17 @@
 #define APP_AUTO_UPDATE_VERSION_MAX 32
 #define APP_AUTO_UPDATE_URL_MAX  384
 #define APP_AUTO_UPDATE_JSON_LIMIT 16384
-#define APP_AUTO_UPDATE_INTERVAL_MS (6ULL * 60ULL * 60ULL * 1000ULL)
-#define APP_UPDATE_RELEASE_API_URL "https://api.github.com/repos/ReggaeShark2001/esp32c6-led-web/releases/latest"
-#define APP_UPDATE_ASSET_NAME    "esp32c6_led_web.bin"
+#define APP_AUTO_UPDATE_SIG_LIMIT  256
+#define APP_AUTO_UPDATE_INTERVAL_MS  ((uint64_t)CONFIG_APP_UPDATE_INTERVAL_HOURS * 60ULL * 60ULL * 1000ULL)
+#define APP_AUTO_UPDATE_JITTER_MS    ((uint64_t)CONFIG_APP_UPDATE_INITIAL_JITTER_MIN * 60ULL * 1000ULL)
+#define APP_UPDATE_RELEASE_REPO  CONFIG_APP_RELEASE_REPO
+#define APP_UPDATE_ASSET_NAME    CONFIG_APP_RELEASE_ASSET_NAME
+#define APP_UPDATE_MANIFEST_NAME CONFIG_APP_RELEASE_MANIFEST_NAME
+#define APP_UPDATE_MANIFEST_SIG_NAME CONFIG_APP_RELEASE_MANIFEST_SIG_NAME
 #define APP_UPDATE_USER_AGENT    "esp32c6-led-web"
+#define APP_UPDATE_SHA256_HEX_LEN 64
+#define APP_UPDATE_SELF_TEST_TIMEOUT_MS ((uint64_t)CONFIG_APP_UPDATE_SELF_TEST_TIMEOUT_S * 1000ULL)
+#define APP_UPDATE_OTA_BUF_SIZE  1024
 
 static const char *TAG = "matter_led";
 static constexpr auto kCommissioningTimeoutSeconds = 300;
@@ -539,6 +552,10 @@ static void copy_string_value(char *dest, size_t dest_size, const char *src)
 typedef struct {
     char version[APP_AUTO_UPDATE_VERSION_MAX];
     char asset_url[APP_AUTO_UPDATE_URL_MAX];
+    uint8_t sha256[32];                 // expected SHA-256 of the .bin
+    size_t  asset_size;                 // expected byte size of the .bin (0 if unknown)
+    uint8_t cohort_percent;             // rollout percent, 0..100 (default 100 if absent)
+    bool    has_sha256;
 } published_update_info_t;
 
 static void set_auto_update_state(bool busy, bool available, const char *latest_version, const char *asset_url,
@@ -657,13 +674,108 @@ static void normalize_release_version(const char *tag, char *output, size_t outp
     copy_string_value(output, output_len, normalized);
 }
 
-static esp_err_t fetch_https_response(const char *url, char **response_out, size_t max_size)
+// Stable "latest" download URL pattern. GitHub redirects to the actual asset
+// at S3; esp_http_client follows 30x by default.
+static void build_release_url(char *out, size_t out_size, const char *asset_name)
 {
-    if (!url || !response_out || max_size < 2) {
+    std::snprintf(out, out_size, "https://github.com/%s/releases/latest/download/%s",
+                  APP_UPDATE_RELEASE_REPO, asset_name);
+}
+
+static int hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+    if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+    return -1;
+}
+
+static bool hex_decode(const char *hex, uint8_t *out, size_t out_len)
+{
+    if (!hex || !out) return false;
+    if (std::strlen(hex) != out_len * 2) return false;
+    for (size_t i = 0; i < out_len; ++i) {
+        int hi = hex_nibble(hex[i * 2]);
+        int lo = hex_nibble(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return true;
+}
+
+// Device cohort id: stable [0, 99] derived from the Wi-Fi STA MAC. Used to
+// decide whether this device participates in a partial rollout. We do NOT
+// hash with any secret here — the goal is just deterministic bucketing.
+static uint8_t device_cohort_id()
+{
+    uint8_t mac[6] = {};
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK) {
+        return 0;
+    }
+    // FNV-1a 32-bit over the 6-byte MAC.
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < 6; ++i) {
+        h ^= mac[i];
+        h *= 16777619u;
+    }
+    return (uint8_t)(h % 100u);
+}
+
+// Verify an ECDSA-P256-SHA256 signature (DER-encoded) over `msg` using the
+// PEM-encoded public key embedded in release_pubkey.h. Returns ESP_OK on
+// valid signature, ESP_ERR_INVALID_STATE if no key configured.
+static esp_err_t verify_manifest_signature(const uint8_t *msg, size_t msg_len,
+                                            const uint8_t *sig, size_t sig_len)
+{
+#if CONFIG_APP_OTA_SIG_VERIFY
+    if (kReleasePubKeyPemLen == 0) {
+        ESP_LOGW(TAG, "No release public key embedded; signature check skipped.");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!msg || !sig || sig_len == 0) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    *response_out = nullptr;
+    uint8_t hash[32];
+    int rc = mbedtls_sha256(msg, msg_len, hash, 0);
+    if (rc != 0) {
+        return ESP_FAIL;
+    }
+
+    mbedtls_pk_context pk;
+    mbedtls_pk_init(&pk);
+    rc = mbedtls_pk_parse_public_key(&pk,
+                                     reinterpret_cast<const unsigned char *>(kReleasePubKeyPem),
+                                     kReleasePubKeyPemLen + 1);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "mbedtls_pk_parse_public_key failed: -0x%04x", -rc);
+        mbedtls_pk_free(&pk);
+        return ESP_FAIL;
+    }
+
+    rc = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, hash, sizeof(hash), sig, sig_len);
+    mbedtls_pk_free(&pk);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "manifest signature verify failed: -0x%04x", -rc);
+        return ESP_ERR_INVALID_CRC;
+    }
+    return ESP_OK;
+#else
+    (void) msg; (void) msg_len; (void) sig; (void) sig_len;
+    ESP_LOGW(TAG, "CONFIG_APP_OTA_SIG_VERIFY=n — manifest signature check skipped.");
+    return ESP_OK;
+#endif
+}
+
+static esp_err_t fetch_https_bytes(const char *url, uint8_t **buf_out, size_t *len_out, size_t max_size,
+                                    const char *accept)
+{
+    if (!url || !buf_out || !len_out || max_size < 2) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *buf_out = nullptr;
+    *len_out = 0;
+
     esp_http_client_config_t config = {};
     config.url = url;
     config.timeout_ms = 15000;
@@ -676,67 +788,61 @@ static esp_err_t fetch_https_response(const char *url, char **response_out, size
     if (!client) {
         return ESP_FAIL;
     }
+    if (accept) {
+        esp_http_client_set_header(client, "Accept", accept);
+    }
 
-    esp_err_t err = esp_http_client_set_header(client, "Accept", "application/vnd.github+json");
-    if (err == ESP_OK) {
-        err = esp_http_client_set_header(client, "X-GitHub-Api-Version", "2022-11-28");
-    }
-    if (err == ESP_OK) {
-        err = esp_http_client_open(client, 0);
-    }
+    esp_err_t err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
         esp_http_client_cleanup(client);
         return err;
     }
 
-    int http_status = 0;
-    char *buffer = static_cast<char *>(malloc(max_size + 1));
-    if (!buffer) {
+    int headers_rc = esp_http_client_fetch_headers(client);
+    if (headers_rc < 0) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return ESP_FAIL;
+    }
+
+    uint8_t *buf = static_cast<uint8_t *>(malloc(max_size + 1));
+    if (!buf) {
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
         return ESP_ERR_NO_MEM;
     }
 
-    http_status = esp_http_client_fetch_headers(client);
-    if (http_status < 0) {
-        free(buffer);
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return ESP_FAIL;
-    }
-
     size_t total = 0;
     while (true) {
         if (total >= max_size) {
-            free(buffer);
+            free(buf);
             esp_http_client_close(client);
             esp_http_client_cleanup(client);
             return ESP_ERR_HTTP_FETCH_HEADER;
         }
-
-        int read = esp_http_client_read(client, buffer + total, max_size - total);
+        int read = esp_http_client_read(client, reinterpret_cast<char *>(buf + total), max_size - total);
         if (read < 0) {
-            free(buffer);
+            free(buf);
             esp_http_client_close(client);
             esp_http_client_cleanup(client);
             return ESP_FAIL;
         }
-        if (read == 0) {
-            break;
-        }
+        if (read == 0) break;
         total += static_cast<size_t>(read);
     }
 
     int status_code = esp_http_client_get_status_code(client);
-    buffer[total] = '\0';
+    buf[total] = '\0';
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
     if (status_code != 200) {
-        free(buffer);
+        ESP_LOGW(TAG, "HTTP %d for %s", status_code, url);
+        free(buf);
         return ESP_FAIL;
     }
 
-    *response_out = buffer;
+    *buf_out = buf;
+    *len_out = total;
     return ESP_OK;
 }
 
@@ -748,51 +854,108 @@ static esp_err_t fetch_latest_published_update(published_update_info_t *info)
 
     info->version[0] = '\0';
     info->asset_url[0] = '\0';
+    info->asset_size = 0;
+    info->cohort_percent = 100;
+    info->has_sha256 = false;
+    std::memset(info->sha256, 0, sizeof(info->sha256));
 
-    char *response = nullptr;
-    esp_err_t err = fetch_https_response(APP_UPDATE_RELEASE_API_URL, &response, APP_AUTO_UPDATE_JSON_LIMIT);
+    char manifest_url[APP_AUTO_UPDATE_URL_MAX];
+    char sig_url[APP_AUTO_UPDATE_URL_MAX];
+    build_release_url(manifest_url, sizeof(manifest_url), APP_UPDATE_MANIFEST_NAME);
+    build_release_url(sig_url, sizeof(sig_url), APP_UPDATE_MANIFEST_SIG_NAME);
+
+    uint8_t *manifest_bytes = nullptr;
+    size_t   manifest_len = 0;
+    esp_err_t err = fetch_https_bytes(manifest_url, &manifest_bytes, &manifest_len,
+                                       APP_AUTO_UPDATE_JSON_LIMIT, "application/json");
     if (err != ESP_OK) {
         return err;
     }
 
-    cJSON *root = cJSON_Parse(response);
-    free(response);
+#if CONFIG_APP_OTA_SIG_VERIFY
+    if (kReleasePubKeyPemLen > 0) {
+        uint8_t *sig_bytes = nullptr;
+        size_t   sig_len = 0;
+        err = fetch_https_bytes(sig_url, &sig_bytes, &sig_len, APP_AUTO_UPDATE_SIG_LIMIT, "application/octet-stream");
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Could not fetch manifest signature");
+            free(manifest_bytes);
+            return ESP_ERR_NOT_FOUND;
+        }
+        err = verify_manifest_signature(manifest_bytes, manifest_len, sig_bytes, sig_len);
+        free(sig_bytes);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Manifest signature invalid — refusing");
+            free(manifest_bytes);
+            return ESP_ERR_INVALID_CRC;
+        }
+    }
+#endif
+
+    cJSON *root = cJSON_ParseWithLength(reinterpret_cast<const char *>(manifest_bytes), manifest_len);
+    free(manifest_bytes);
     if (!root) {
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    cJSON *tag_name = cJSON_GetObjectItemCaseSensitive(root, "tag_name");
-    cJSON *assets = cJSON_GetObjectItemCaseSensitive(root, "assets");
-    if (!cJSON_IsString(tag_name) || !cJSON_IsArray(assets)) {
+    cJSON *version = cJSON_GetObjectItemCaseSensitive(root, "version");
+    cJSON *chip = cJSON_GetObjectItemCaseSensitive(root, "chip");
+    cJSON *app_obj = cJSON_GetObjectItemCaseSensitive(root, "app");
+    if (!cJSON_IsString(version) || !cJSON_IsObject(app_obj)) {
         cJSON_Delete(root);
         return ESP_ERR_INVALID_RESPONSE;
     }
+    if (cJSON_IsString(chip) && std::strcmp(chip->valuestring, "esp32c6") != 0) {
+        ESP_LOGW(TAG, "Manifest chip=%s does not match esp32c6", chip->valuestring);
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_VERSION;
+    }
 
-    normalize_release_version(tag_name->valuestring, info->version, sizeof(info->version));
-    cJSON *asset = nullptr;
-    cJSON_ArrayForEach(asset, assets) {
-        cJSON *name = cJSON_GetObjectItemCaseSensitive(asset, "name");
-        cJSON *browser_download_url = cJSON_GetObjectItemCaseSensitive(asset, "browser_download_url");
-        if (cJSON_IsString(name) && cJSON_IsString(browser_download_url) &&
-            std::strcmp(name->valuestring, APP_UPDATE_ASSET_NAME) == 0) {
-            copy_string_value(info->asset_url, sizeof(info->asset_url), browser_download_url->valuestring);
-            break;
+    normalize_release_version(version->valuestring, info->version, sizeof(info->version));
+
+    cJSON *url = cJSON_GetObjectItemCaseSensitive(app_obj, "url");
+    cJSON *sha = cJSON_GetObjectItemCaseSensitive(app_obj, "sha256");
+    cJSON *size = cJSON_GetObjectItemCaseSensitive(app_obj, "size");
+    if (cJSON_IsString(url)) {
+        copy_string_value(info->asset_url, sizeof(info->asset_url), url->valuestring);
+    } else {
+        // Fall back to the canonical /releases/latest/download/ URL — same effect.
+        build_release_url(info->asset_url, sizeof(info->asset_url), APP_UPDATE_ASSET_NAME);
+    }
+    if (cJSON_IsString(sha) && std::strlen(sha->valuestring) == APP_UPDATE_SHA256_HEX_LEN) {
+        info->has_sha256 = hex_decode(sha->valuestring, info->sha256, sizeof(info->sha256));
+    }
+    if (cJSON_IsNumber(size) && size->valuedouble > 0) {
+        info->asset_size = (size_t) size->valuedouble;
+    }
+
+    cJSON *rollout = cJSON_GetObjectItemCaseSensitive(root, "rollout");
+    if (cJSON_IsObject(rollout)) {
+        cJSON *pct = cJSON_GetObjectItemCaseSensitive(rollout, "percent");
+        if (cJSON_IsNumber(pct)) {
+            double p = pct->valuedouble;
+            if (p < 0) p = 0;
+            if (p > 100) p = 100;
+            info->cohort_percent = (uint8_t) p;
         }
     }
-    cJSON_Delete(root);
 
+    cJSON_Delete(root);
     return info->asset_url[0] != '\0' ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
-static esp_err_t install_https_ota_from_url(const char *url)
+// Stream-download the firmware image into the inactive OTA partition while
+// computing SHA-256 along the way. Returns ESP_OK only if the computed digest
+// matches `expected_sha256` (when provided) and the image passes IDF validation.
+static esp_err_t install_https_ota_with_verify(const published_update_info_t *info)
 {
-    if (!url || url[0] == '\0') {
+    if (!info || info->asset_url[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
 
     esp_http_client_config_t http_config = {};
-    http_config.url = url;
-    http_config.timeout_ms = 20000;
+    http_config.url = info->asset_url;
+    http_config.timeout_ms = 30000;
     http_config.transport_type = HTTP_TRANSPORT_OVER_SSL;
     http_config.crt_bundle_attach = esp_crt_bundle_attach;
     http_config.user_agent = APP_UPDATE_USER_AGENT;
@@ -800,7 +963,114 @@ static esp_err_t install_https_ota_from_url(const char *url)
 
     esp_https_ota_config_t ota_config = {};
     ota_config.http_config = &http_config;
-    return esp_https_ota(&ota_config);
+
+    esp_https_ota_handle_t handle = nullptr;
+    esp_err_t err = esp_https_ota_begin(&ota_config, &handle);
+    if (err != ESP_OK || handle == nullptr) {
+        ESP_LOGE(TAG, "esp_https_ota_begin failed: %s", esp_err_to_name(err));
+        return err == ESP_OK ? ESP_FAIL : err;
+    }
+
+    while (true) {
+        err = esp_https_ota_perform(handle);
+        if (err != ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
+            break;
+        }
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_https_ota_perform failed: %s", esp_err_to_name(err));
+        esp_https_ota_abort(handle);
+        return err;
+    }
+
+    if (!esp_https_ota_is_complete_data_received(handle)) {
+        ESP_LOGE(TAG, "OTA stream ended before all data received");
+        esp_https_ota_abort(handle);
+        return ESP_FAIL;
+    }
+
+    int image_len = esp_https_ota_get_image_size(handle);
+    err = esp_https_ota_finish(handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_https_ota_finish failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    if (image_len <= 0) {
+        ESP_LOGE(TAG, "Downloaded image has zero size");
+        return ESP_FAIL;
+    }
+    if (info->asset_size != 0 && (size_t) image_len != info->asset_size) {
+        ESP_LOGE(TAG, "Image size %d does not match manifest %u", image_len, (unsigned) info->asset_size);
+        // Roll back boot partition to the running one before bailing.
+        const esp_partition_t *running = esp_ota_get_running_partition();
+        if (running) {
+            esp_ota_set_boot_partition(running);
+        }
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    if (info->has_sha256) {
+        // Read the freshly written partition back and SHA-256 it.
+        const esp_partition_t *next = esp_ota_get_next_update_partition(nullptr);
+        if (!next) {
+            ESP_LOGE(TAG, "Could not locate the just-written OTA partition");
+            return ESP_FAIL;
+        }
+
+        mbedtls_sha256_context sha_ctx;
+        mbedtls_sha256_init(&sha_ctx);
+        if (mbedtls_sha256_starts(&sha_ctx, 0) != 0) {
+            mbedtls_sha256_free(&sha_ctx);
+            return ESP_FAIL;
+        }
+
+        uint8_t *buf = static_cast<uint8_t *>(malloc(APP_UPDATE_OTA_BUF_SIZE));
+        if (!buf) {
+            mbedtls_sha256_free(&sha_ctx);
+            return ESP_ERR_NO_MEM;
+        }
+        size_t remaining = (size_t) image_len;
+        size_t offset = 0;
+        while (remaining > 0) {
+            size_t chunk = remaining < APP_UPDATE_OTA_BUF_SIZE ? remaining : APP_UPDATE_OTA_BUF_SIZE;
+            esp_err_t rerr = esp_partition_read(next, offset, buf, chunk);
+            if (rerr != ESP_OK) {
+                free(buf);
+                mbedtls_sha256_free(&sha_ctx);
+                return rerr;
+            }
+            if (mbedtls_sha256_update(&sha_ctx, buf, chunk) != 0) {
+                free(buf);
+                mbedtls_sha256_free(&sha_ctx);
+                return ESP_FAIL;
+            }
+            offset += chunk;
+            remaining -= chunk;
+        }
+        free(buf);
+
+        uint8_t actual[32];
+        if (mbedtls_sha256_finish(&sha_ctx, actual) != 0) {
+            mbedtls_sha256_free(&sha_ctx);
+            return ESP_FAIL;
+        }
+        mbedtls_sha256_free(&sha_ctx);
+
+        if (std::memcmp(actual, info->sha256, sizeof(actual)) != 0) {
+            ESP_LOGE(TAG, "OTA SHA-256 mismatch — reverting boot partition");
+            const esp_partition_t *running = esp_ota_get_running_partition();
+            if (running) {
+                esp_ota_set_boot_partition(running);
+            }
+            return ESP_ERR_INVALID_CRC;
+        }
+        ESP_LOGI(TAG, "OTA SHA-256 verified (%d bytes)", image_len);
+    } else {
+        ESP_LOGW(TAG, "Manifest has no sha256 — installed without integrity check");
+    }
+
+    return ESP_OK;
 }
 
 static void run_published_update_check(bool install_if_new)
@@ -843,9 +1113,19 @@ static void run_published_update_check(bool install_if_new)
         return;
     }
 
-    if (!install_if_new) {
+    // Cohort gating: skip if this device is outside the rollout slice. We still
+    // surface that an update exists, just don't install it.
+    uint8_t cohort = device_cohort_id();
+    bool in_rollout = cohort < release.cohort_percent;
+
+    if (!install_if_new || !in_rollout) {
         char status[APP_AUTO_UPDATE_STATUS_MAX];
-        std::snprintf(status, sizeof(status), "Published update %s is available.", release.version);
+        if (!in_rollout) {
+            std::snprintf(status, sizeof(status), "Update %s available (cohort %u/%u, waiting).",
+                          release.version, cohort, release.cohort_percent);
+        } else {
+            std::snprintf(status, sizeof(status), "Published update %s is available.", release.version);
+        }
         set_auto_update_state(false, true, release.version, release.asset_url, status);
         xSemaphoreGive(s_ota_mutex);
         return;
@@ -854,9 +1134,10 @@ static void run_published_update_check(bool install_if_new)
     char status[APP_AUTO_UPDATE_STATUS_MAX];
     std::snprintf(status, sizeof(status), "Installing published update %s...", release.version);
     set_auto_update_state(true, true, release.version, release.asset_url, status);
-    err = install_https_ota_from_url(release.asset_url);
+    err = install_https_ota_with_verify(&release);
     if (err != ESP_OK) {
-        std::snprintf(status, sizeof(status), "Published update %s failed to install.", release.version);
+        std::snprintf(status, sizeof(status), "Published update %s failed to install (%s).",
+                      release.version, esp_err_to_name(err));
         set_auto_update_state(false, true, release.version, release.asset_url, status);
         xSemaphoreGive(s_ota_mutex);
         return;
@@ -872,14 +1153,74 @@ static void run_published_update_check(bool install_if_new)
 static void auto_update_task(void *arg)
 {
     (void) arg;
-    while (true) {
-        uint32_t notify_count = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(APP_AUTO_UPDATE_INTERVAL_MS));
-        bool install_if_new = is_auto_update_enabled();
-        if (!install_if_new && notify_count == 0) {
-            continue;
-        }
-        run_published_update_check(install_if_new);
+
+    // Initial jitter: random [0, APP_UPDATE_INITIAL_JITTER_MIN] minutes so a
+    // freshly-published release doesn't trigger a herd download from every
+    // device on the same Wi-Fi at once. A manual "check now" notify still
+    // wakes us early.
+    uint32_t jitter_ms = 0;
+    if (APP_AUTO_UPDATE_JITTER_MS > 0) {
+        jitter_ms = (uint32_t)(esp_random() % APP_AUTO_UPDATE_JITTER_MS);
+        ESP_LOGI(TAG, "Auto-update: initial jitter %u ms", (unsigned) jitter_ms);
     }
+    if (jitter_ms > 0) {
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(jitter_ms));
+    }
+
+    while (true) {
+        bool install_if_new = is_auto_update_enabled();
+        run_published_update_check(install_if_new);
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(APP_AUTO_UPDATE_INTERVAL_MS));
+    }
+}
+
+// Self-test: once Wi-Fi STA has an IP and the HTTP server is up, the freshly
+// booted image is "good enough" — mark the OTA slot valid so the bootloader
+// won't roll back on the next reset. If the deadline expires first, abort the
+// rollback-prevention so the bootloader picks the previous slot on reboot.
+static void self_test_task(void *arg)
+{
+    (void) arg;
+
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+    if (!running || esp_ota_get_state_partition(running, &state) != ESP_OK) {
+        ESP_LOGW(TAG, "self-test: could not read OTA partition state");
+        vTaskDelete(nullptr);
+        return;
+    }
+    if (state != ESP_OTA_IMG_PENDING_VERIFY) {
+        // Either this is a USB-flashed build (not under rollback control) or a
+        // previously-validated image — nothing to do.
+        ESP_LOGI(TAG, "self-test: partition state=%d (no verify needed)", (int) state);
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    ESP_LOGI(TAG, "self-test: pending verify, waiting up to %llu ms for STA + HTTP",
+             APP_UPDATE_SELF_TEST_TIMEOUT_MS);
+
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(APP_UPDATE_SELF_TEST_TIMEOUT_MS);
+    while (xTaskGetTickCount() < deadline) {
+        bool sta_ok = s_sta_ip[0] != '\0';
+        bool http_ok = s_http_server != nullptr;
+        if (sta_ok && http_ok) {
+            esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "self-test: OK, marked image valid (cohort=%u)", device_cohort_id());
+            } else {
+                ESP_LOGW(TAG, "self-test: mark_app_valid failed: %s", esp_err_to_name(err));
+            }
+            vTaskDelete(nullptr);
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    ESP_LOGE(TAG, "self-test: deadline reached without STA+HTTP — rolling back");
+    // mark_app_invalid_and_reboot reboots into the previous slot.
+    esp_ota_mark_app_invalid_rollback_and_reboot();
+    vTaskDelete(nullptr);
 }
 
 static void set_generated_ap_credentials()
@@ -2808,6 +3149,7 @@ extern "C" void app_main()
                           is_auto_update_enabled() ? "Waiting for LAN Wi-Fi before checking published updates."
                                                    : "Auto-update is disabled.");
     xTaskCreate(auto_update_task, "auto_update", 8192, nullptr, 4, &s_auto_update_task);
+    xTaskCreate(self_test_task, "self_test", 4096, nullptr, 5, nullptr);
     xTaskCreate(effect_task, "effect_task", 4096, nullptr, 4, nullptr);
     xTaskCreate(captive_dns_task, "captive_dns", 4096, nullptr, 4, nullptr);
 

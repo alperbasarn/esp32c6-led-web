@@ -10,6 +10,10 @@ env:
   IDF_VERSION: v5.4.1
   ESP_MATTER_REF: c6f767254f6267e057916981646a44c65d034254
   FIRMWARE_ASSET_NAME: esp32c6_led_web.bin
+  MANIFEST_ASSET_NAME: manifest.json
+  MANIFEST_SIG_ASSET_NAME: manifest.json.sig
+  BOOTLOADER_ASSET_NAME: bootloader.bin
+  PARTITION_TABLE_ASSET_NAME: partition-table.bin
 
 jobs:
   build-and-publish:
@@ -68,20 +72,50 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           idf.py set-target esp32c6 build
 
+      - name: Generate signed manifest
+        if: github.event_name == 'release'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          REPO_SLUG: ${{ github.repository }}
+          IDF_REF: ${{ env.IDF_VERSION }}
+          MATTER_REF: ${{ env.ESP_MATTER_REF }}
+          APP_BIN: build/${{ env.FIRMWARE_ASSET_NAME }}
+          SIGNING_KEY_PEM: ${{ secrets.MANIFEST_SIGNING_KEY }}
+        run: |
+          chmod +x scripts/generate-manifest.sh
+          scripts/generate-manifest.sh
+
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: esp32c6-led-web-firmware
           path: |
             build/esp32c6_led_web.bin
+            build/bootloader/bootloader.bin
+            build/partition_table/partition-table.bin
             build/project_description.json
-          if-no-files-found: error
+            manifest.json
+            manifest.json.sig
+          if-no-files-found: warn
 
-      - name: Attach firmware to published release
+      - name: Attach release artifacts
         if: github.event_name == 'release'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
+          # The application binary (used by OTA).
           gh release upload "$RELEASE_TAG" "build/$FIRMWARE_ASSET_NAME" --clobber
+
+          # Bootloader + partition table for first-time USB flashing.
+          gh release upload "$RELEASE_TAG" \
+            "build/bootloader/$BOOTLOADER_ASSET_NAME" \
+            "build/partition_table/$PARTITION_TABLE_ASSET_NAME" --clobber || true
+
+          # Signed manifest (devices fetch via /releases/latest/download/manifest.json).
+          gh release upload "$RELEASE_TAG" "$MANIFEST_ASSET_NAME" --clobber
+          if [ -f "$MANIFEST_SIG_ASSET_NAME" ]; then
+            gh release upload "$RELEASE_TAG" "$MANIFEST_SIG_ASSET_NAME" --clobber
+          fi

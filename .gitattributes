@@ -1,0 +1,8 @@
+* text=auto
+
+# Shell scripts and CI-relevant files must keep LF endings.
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+Kconfig* text eol=lf
+sdkconfig.defaults text eol=lf

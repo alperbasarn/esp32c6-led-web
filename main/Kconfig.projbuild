@@ -1,0 +1,53 @@
+menu "ESP32-C6 LED Web — OTA / Release settings"
+
+config APP_RELEASE_REPO
+    string "GitHub repository to poll for releases (owner/name)"
+    default "alperbasarn/esp32c6-led-web"
+    help
+        Used to build the manifest and asset URLs the device hits.
+        Override in CI by writing to sdkconfig.defaults before build, or set in menuconfig.
+
+config APP_RELEASE_ASSET_NAME
+    string "Firmware asset filename in the GitHub release"
+    default "esp32c6_led_web.bin"
+    help
+        Must match the filename the publish-firmware workflow uploads.
+
+config APP_RELEASE_MANIFEST_NAME
+    string "Manifest filename in the GitHub release"
+    default "manifest.json"
+
+config APP_RELEASE_MANIFEST_SIG_NAME
+    string "Detached signature filename in the GitHub release"
+    default "manifest.json.sig"
+
+config APP_UPDATE_INTERVAL_HOURS
+    int "Hours between auto-update polls"
+    range 1 168
+    default 6
+
+config APP_UPDATE_INITIAL_JITTER_MIN
+    int "First-poll random delay after Wi-Fi up (minutes)"
+    range 0 120
+    default 30
+    help
+        Avoids the herd effect right after publishing a release: every device picks a
+        random delay in [0, this many minutes] before its first manifest fetch.
+
+config APP_UPDATE_SELF_TEST_TIMEOUT_S
+    int "First-boot self-test deadline before rollback (seconds)"
+    range 30 600
+    default 90
+    help
+        After an OTA reboot the app must come up and complete the self-test inside
+        this window, otherwise IDF rolls back to the previous slot.
+
+config APP_OTA_SIG_VERIFY
+    bool "Verify manifest signature with embedded ECDSA P-256 public key"
+    default y
+    help
+        Signature verification uses the public key embedded at build time in
+        main/include/release_pubkey.h. Disabling skips verification — only safe
+        for local dev builds.
+
+endmenu

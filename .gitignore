@@ -7,3 +7,17 @@ sdkconfig.pre-matter
 
 *.pyc
 .DS_Store
+
+# Release signing keys — NEVER commit the private key.
+# The public key is committed inside main/include/release_pubkey.h.
+.keys/
+
+# Local setup/install helpers (used by Claude Code, not part of the project)
+.setup.log
+.matter-setup.wrapper.log
+.matter-setup.wrapper.log.err
+.wsl-setup.sh
+.wsl-probe.sh
+.wsl-matter-setup.sh
+.matter-install.done
+.matter-install.failed
