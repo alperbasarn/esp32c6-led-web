@@ -944,6 +944,146 @@ static esp_err_t fetch_latest_published_update(published_update_info_t *info)
     return info->asset_url[0] != '\0' ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
+// Probation marker — persisted across reboots so we can implement an
+// N-strike rollback policy. Lives in its own NVS namespace so factory reset
+// of led_cfg doesn't disturb it.
+//
+//   slot    : "ota_0" / "ota_1" — partition label of the image on probation
+//   ver     : manifest.version of that image (debug)
+//   strikes : boot attempts so far. > APP_OTA_MAX_STRIKES → rollback.
+#define APP_OTA_HEALTH_NS          "ota_health"
+#define APP_OTA_HEALTH_KEY_SLOT    "slot"
+#define APP_OTA_HEALTH_KEY_VER     "ver"
+#define APP_OTA_HEALTH_KEY_STRIKES "strikes"
+#define APP_OTA_MAX_STRIKES        2
+
+static esp_err_t ota_health_clear()
+{
+    nvs_handle_t h = 0;
+    esp_err_t err = nvs_open(APP_OTA_HEALTH_NS, NVS_READWRITE, &h);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+    nvs_erase_all(h);
+    nvs_commit(h);
+    nvs_close(h);
+    return ESP_OK;
+}
+
+static esp_err_t ota_health_read(char *slot, size_t slot_len, char *ver, size_t ver_len, uint8_t *strikes)
+{
+    nvs_handle_t h = 0;
+    esp_err_t err = nvs_open(APP_OTA_HEALTH_NS, NVS_READONLY, &h);
+    if (err != ESP_OK) {
+        return err;  // ESP_ERR_NVS_NOT_FOUND if no marker yet
+    }
+    size_t s_len = slot_len;
+    size_t v_len = ver_len;
+    if (slot && slot_len) slot[0] = '\0';
+    if (ver && ver_len)  ver[0] = '\0';
+    if (strikes) *strikes = 0;
+
+    err = nvs_get_str(h, APP_OTA_HEALTH_KEY_SLOT, slot, &s_len);
+    if (err != ESP_OK) { nvs_close(h); return err; }
+    err = nvs_get_str(h, APP_OTA_HEALTH_KEY_VER, ver, &v_len);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) { nvs_close(h); return err; }
+    if (strikes) {
+        uint8_t v = 0;
+        err = nvs_get_u8(h, APP_OTA_HEALTH_KEY_STRIKES, &v);
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            v = 0;
+            err = ESP_OK;
+        }
+        *strikes = v;
+    }
+    nvs_close(h);
+    return ESP_OK;
+}
+
+static esp_err_t ota_health_write(const char *slot, const char *ver, uint8_t strikes)
+{
+    nvs_handle_t h = 0;
+    esp_err_t err = nvs_open(APP_OTA_HEALTH_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    nvs_set_str(h, APP_OTA_HEALTH_KEY_SLOT, slot ? slot : "");
+    nvs_set_str(h, APP_OTA_HEALTH_KEY_VER, ver ? ver : "");
+    nvs_set_u8(h, APP_OTA_HEALTH_KEY_STRIKES, strikes);
+    err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
+// Called very early in app_main, right after NVS init. Manages the
+// probationary boot lifecycle: if the running image is under probation,
+// either roll back (too many failed attempts), or increment the strike
+// counter and mark the image valid so the bootloader's built-in 1-strike
+// rollback doesn't fire ahead of us.
+static void init_ota_probation()
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (!running) {
+        return;
+    }
+
+    char marker_slot[16] = "";
+    char marker_ver[APP_AUTO_UPDATE_VERSION_MAX] = "";
+    uint8_t strikes = 0;
+    esp_err_t err = ota_health_read(marker_slot, sizeof(marker_slot),
+                                    marker_ver, sizeof(marker_ver), &strikes);
+    if (err == ESP_ERR_NVS_NOT_FOUND || marker_slot[0] == '\0') {
+        // No probation in progress — nothing to do. If the bootloader marked
+        // us PENDING_VERIFY anyway (e.g., first OTA from a previous firmware
+        // that didn't write a marker), fall back to default ROLLBACK_ENABLE
+        // behavior: the legacy self-test will mark us valid later.
+        return;
+    }
+
+    if (std::strcmp(marker_slot, running->label) != 0) {
+        // Marker references a different slot than what's running. Either the
+        // image was swapped by USB flash / manual revert, or the marker is
+        // stale from a previous run. Clear it.
+        ESP_LOGI(TAG, "OTA probation marker is stale (slot=%s, running=%s) — clearing",
+                 marker_slot, running->label);
+        ota_health_clear();
+        return;
+    }
+
+    uint8_t next_strikes = strikes + 1;
+    ESP_LOGI(TAG, "OTA probation: slot=%s ver=%s attempt=%u (max=%u)",
+             marker_slot, marker_ver, next_strikes, APP_OTA_MAX_STRIKES);
+
+    if (next_strikes > APP_OTA_MAX_STRIKES) {
+        ESP_LOGE(TAG, "OTA probation: too many failed attempts — rolling back");
+        const esp_partition_t *other = esp_ota_get_next_update_partition(nullptr);
+        if (other) {
+            esp_err_t set_err = esp_ota_set_boot_partition(other);
+            ESP_LOGW(TAG, "esp_ota_set_boot_partition(%s): %s",
+                     other->label, esp_err_to_name(set_err));
+        }
+        ota_health_clear();
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_restart();
+    }
+
+    // Persist the bumped strike count BEFORE marking valid. Order matters: a
+    // crash between the increment and mark_valid still gives us a higher
+    // strike count on the next boot.
+    ota_health_write(marker_slot, marker_ver, next_strikes);
+
+    // Neuter the bootloader's 1-strike rollback so we can manage attempts
+    // ourselves. self_test_task will clear the marker on success.
+    esp_err_t mv = esp_ota_mark_app_valid_cancel_rollback();
+    if (mv != ESP_OK && mv != ESP_ERR_NOT_SUPPORTED) {
+        // Not in PENDING_VERIFY (image was already valid) — fine, ignore.
+        ESP_LOGD(TAG, "mark_app_valid: %s", esp_err_to_name(mv));
+    }
+}
+
 // Stream-download the firmware image into the inactive OTA partition while
 // computing SHA-256 along the way. Returns ESP_OK only if the computed digest
 // matches `expected_sha256` (when provided) and the image passes IDF validation.
@@ -1070,6 +1210,19 @@ static esp_err_t install_https_ota_with_verify(const published_update_info_t *in
         ESP_LOGW(TAG, "Manifest has no sha256 — installed without integrity check");
     }
 
+    // Write the probation marker so the next boot enters the 2-strike state
+    // machine. esp_https_ota_finish has already pointed the boot target at
+    // the new slot, so esp_ota_get_next_update_partition(NULL) returns that
+    // slot (the one we just wrote).
+    const esp_partition_t *target = esp_ota_get_next_update_partition(nullptr);
+    if (target) {
+        esp_err_t herr = ota_health_write(target->label, info->version, 0);
+        if (herr != ESP_OK) {
+            ESP_LOGW(TAG, "ota_health_write failed: %s (rollback safety degraded)",
+                     esp_err_to_name(herr));
+        }
+    }
+
     return ESP_OK;
 }
 
@@ -1174,52 +1327,59 @@ static void auto_update_task(void *arg)
     }
 }
 
-// Self-test: once Wi-Fi STA has an IP and the HTTP server is up, the freshly
-// booted image is "good enough" — mark the OTA slot valid so the bootloader
-// won't roll back on the next reset. If the deadline expires first, abort the
-// rollback-prevention so the bootloader picks the previous slot on reboot.
+// Self-test: a freshly OTA-installed image is considered healthy when (a) we
+// have an STA IP (or AP credentials at minimum) and (b) the Matter stack is
+// running. On success we clear the probation marker — the image is permanent.
+// On timeout we just reboot. The next boot's init_ota_probation() will
+// increment the strike count and roll back after APP_OTA_MAX_STRIKES failures.
+//
+// Manages probation strictly via the NVS marker (written by
+// install_https_ota_with_verify), not the partition state, because
+// init_ota_probation() already called mark_app_valid_cancel_rollback() and
+// neutralized the bootloader's PENDING_VERIFY tracking.
 static void self_test_task(void *arg)
 {
     (void) arg;
 
     const esp_partition_t *running = esp_ota_get_running_partition();
-    esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
-    if (!running || esp_ota_get_state_partition(running, &state) != ESP_OK) {
-        ESP_LOGW(TAG, "self-test: could not read OTA partition state");
-        vTaskDelete(nullptr);
-        return;
-    }
-    if (state != ESP_OTA_IMG_PENDING_VERIFY) {
-        // Either this is a USB-flashed build (not under rollback control) or a
-        // previously-validated image — nothing to do.
-        ESP_LOGI(TAG, "self-test: partition state=%d (no verify needed)", (int) state);
+    if (!running) {
         vTaskDelete(nullptr);
         return;
     }
 
-    ESP_LOGI(TAG, "self-test: pending verify, waiting up to %llu ms for STA + HTTP",
-             APP_UPDATE_SELF_TEST_TIMEOUT_MS);
+    char marker_slot[16] = "";
+    char marker_ver[APP_AUTO_UPDATE_VERSION_MAX] = "";
+    uint8_t strikes = 0;
+    esp_err_t err = ota_health_read(marker_slot, sizeof(marker_slot),
+                                    marker_ver, sizeof(marker_ver), &strikes);
+    if (err != ESP_OK || marker_slot[0] == '\0' ||
+        std::strcmp(marker_slot, running->label) != 0) {
+        // No active probation — nothing to verify.
+        ESP_LOGI(TAG, "self-test: no probation marker for %s; skipping", running->label);
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    ESP_LOGI(TAG, "self-test: probation active (ver=%s strikes=%u), waiting up to %llu ms for STA + Matter",
+             marker_ver, strikes, APP_UPDATE_SELF_TEST_TIMEOUT_MS);
 
     const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(APP_UPDATE_SELF_TEST_TIMEOUT_MS);
     while (xTaskGetTickCount() < deadline) {
         bool sta_ok = s_sta_ip[0] != '\0';
-        bool http_ok = s_http_server != nullptr;
-        if (sta_ok && http_ok) {
-            esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
-            if (err == ESP_OK) {
-                ESP_LOGI(TAG, "self-test: OK, marked image valid (cohort=%u)", device_cohort_id());
-            } else {
-                ESP_LOGW(TAG, "self-test: mark_app_valid failed: %s", esp_err_to_name(err));
-            }
+        bool matter_ok = matter_is_ready();
+        if (sta_ok && matter_ok) {
+            ota_health_clear();
+            ESP_LOGI(TAG, "self-test: OK — STA up, Matter ready. Image promoted.");
             vTaskDelete(nullptr);
             return;
         }
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
-    ESP_LOGE(TAG, "self-test: deadline reached without STA+HTTP — rolling back");
-    // mark_app_invalid_and_reboot reboots into the previous slot.
-    esp_ota_mark_app_invalid_rollback_and_reboot();
+    ESP_LOGE(TAG, "self-test: deadline reached without STA+Matter — rebooting "
+                  "(strike %u of %u allowed)", strikes, APP_OTA_MAX_STRIKES);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    esp_restart();
     vTaskDelete(nullptr);
 }
 
@@ -3117,6 +3277,10 @@ extern "C" void app_main()
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    // Probationary-boot check — must run before any task that might crash and
+    // take us back through the bootloader without incrementing the strike count.
+    init_ota_probation();
 
     s_state_mutex = xSemaphoreCreateMutex();
     assert(s_state_mutex != nullptr);
