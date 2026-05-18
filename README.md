@@ -141,7 +141,5 @@ To bootstrap a fresh fork: generate a new keypair as above, replace the placehol
 - `sparkle`: spark density, base glow, twinkle speed
 - `wave`: wave speed, wavelength, wave depth
 - The LED count set in the page is clamped to the compiled-in maximum.
-- If your strip uses a different GPIO, update `APP_LED_GPIO` in `main/app_main.cpp`.
-- On the XIAO ESP32C6, `D7` maps to `GPIO17`.
-- If you want more than `120` pixels, update `APP_LED_MAX_PIXELS` in `main/app_main.cpp`.
+- LED GPIO and maximum pixel count are build-time settings. Run `idf.py menuconfig`, navigate to **ESP32-C6 LED Web — Hardware**, and adjust `APP_LED_GPIO` / `APP_LED_MAX_PIXELS`. For a one-off override, put `CONFIG_APP_LED_GPIO=18` in `sdkconfig.local` (gitignored) before building. The default is GPIO 17, which is D7 on a XIAO ESP32C6.
 - The serial monitor is the most reliable place to get the first Matter pairing codes after boot.

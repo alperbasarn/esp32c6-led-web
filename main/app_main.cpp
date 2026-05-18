@@ -50,8 +50,8 @@
 #define APP_WIFI_CHANNEL         6
 #define APP_WIFI_MAX_STA_CONN    4
 
-#define APP_LED_GPIO             17
-#define APP_LED_MAX_PIXELS       120
+#define APP_LED_GPIO             CONFIG_APP_LED_GPIO
+#define APP_LED_MAX_PIXELS       CONFIG_APP_LED_MAX_PIXELS
 #define APP_LED_DEFAULT_COUNT    8
 #define APP_LED_DEFAULT_RED      255
 #define APP_LED_DEFAULT_GREEN    96

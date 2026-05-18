@@ -1,3 +1,28 @@
+menu "ESP32-C6 LED Web — Hardware"
+
+config APP_LED_GPIO
+    int "GPIO connected to WS2812B DIN"
+    range 0 30
+    default 17
+    help
+        Data-in pin for the LED strip. XIAO ESP32C6 board mapping:
+        D0=GPIO0, D1=GPIO1, D2=GPIO2, D3=GPIO21, D4=GPIO22, D5=GPIO23,
+        D6=GPIO16, D7=GPIO17, D8=GPIO19, D9=GPIO20, D10=GPIO18.
+        Avoid GPIO 10/11 (SPI flash) and GPIO 12/13 (USB JTAG) on bare
+        ESP32-C6 modules.
+
+config APP_LED_MAX_PIXELS
+    int "Maximum number of pixels the firmware will drive"
+    range 1 1024
+    default 256
+    help
+        Compile-time upper bound on strip length. Runtime LED count is
+        configurable in the captive portal up to this limit. RAM cost is
+        roughly 4 bytes per pixel for the RMT-driver encode buffer plus
+        the small fixed overhead, so 256 is ~1 KB.
+
+endmenu
+
 menu "ESP32-C6 LED Web — OTA / Release settings"
 
 config APP_RELEASE_REPO
