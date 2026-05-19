@@ -49,6 +49,23 @@ jobs:
         run: |
           export IDF_PATH="$HOME/esp-idf"
           source "$IDF_PATH/export.sh" >/dev/null
+
+          # Strip `bluezoo` from connectedhomeip's pip requirements. It's a
+          # BlueZ mock for host-side tests (we pass --no-host-tool anyway), and
+          # recent PyPI releases pull in transitive deps that conflict with
+          # other CHIP-pinned packages, breaking pip-tools compile. This is
+          # purely a CI workaround; local installs that already cached a
+          # working bluezoo continue to work.
+          chip="$HOME/esp-matter/connectedhomeip/connectedhomeip"
+          for f in "$chip"/scripts/setup/requirements.build.txt \
+                   "$chip"/scripts/setup/requirements.txt \
+                   "$chip"/scripts/setup/constraints.txt \
+                   "$chip"/scripts/tests/requirements.txt; do
+            if [ -f "$f" ]; then
+              sed -i '/^[[:space:]]*bluezoo/d; /via bluezoo/d' "$f"
+            fi
+          done
+
           cd "$HOME/esp-matter"
           ./install.sh --no-host-tool
 
