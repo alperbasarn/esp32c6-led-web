@@ -30,21 +30,45 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install ESP-IDF
+      # Cache ESP-IDF + its toolchain. Keyed on IDF_VERSION — bump the suffix
+      # ("v1") to force a rebuild if cache contents become stale.
+      - name: Restore ESP-IDF cache
+        id: cache-idf
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/esp-idf
+            ~/.espressif
+          key: idf-${{ env.IDF_VERSION }}-${{ runner.os }}-v1
+
+      - name: Install ESP-IDF (cache miss)
+        if: steps.cache-idf.outputs.cache-hit != 'true'
         shell: bash
         run: |
           git clone --depth 1 --branch "$IDF_VERSION" --recursive https://github.com/espressif/esp-idf.git "$HOME/esp-idf"
           cd "$HOME/esp-idf"
           ./install.sh esp32c6
 
-      - name: Check out esp-matter
+      # Cache esp-matter (clone + submodules + the chip .environment built by
+      # install.sh). Keyed on ESP_MATTER_REF so any pin bump invalidates.
+      - name: Restore esp-matter cache
+        id: cache-matter
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/esp-matter
+          key: matter-${{ env.ESP_MATTER_REF }}-${{ runner.os }}-v1
+
+      - name: Check out esp-matter (cache miss)
+        if: steps.cache-matter.outputs.cache-hit != 'true'
         shell: bash
         run: |
           git clone --recursive https://github.com/espressif/esp-matter.git "$HOME/esp-matter"
           git -C "$HOME/esp-matter" checkout "$ESP_MATTER_REF"
           git -C "$HOME/esp-matter" submodule update --init --recursive
 
-      - name: Install esp-matter dependencies
+      - name: Install esp-matter dependencies (cache miss)
+        if: steps.cache-matter.outputs.cache-hit != 'true'
         shell: bash
         run: |
           export IDF_PATH="$HOME/esp-idf"
