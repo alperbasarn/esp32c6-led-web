@@ -168,6 +168,15 @@ static bool s_syncing_matter = false;
 static bool s_network_handlers_registered = false;
 static char s_ap_ip[16] = "192.168.4.1";
 static char s_sta_ip[16] = "";
+static char s_sta_ssid[33] = "";
+static char s_sta_bssid[18] = "";
+static int s_sta_rssi = 0;
+static uint8_t s_sta_channel = 0;
+static uint16_t s_sta_last_disconnect_reason = 0;
+static uint32_t s_sta_connect_count = 0;
+static uint32_t s_sta_disconnect_count = 0;
+static uint32_t s_sta_last_event_ms = 0;
+static uint32_t s_sta_last_ip_ms = 0;
 static char s_ap_ssid[33] = "";
 static char s_ap_password[65] = "";
 static char s_runtime_ap_ssid[33] = "";
@@ -175,6 +184,9 @@ static char s_runtime_ap_password[65] = "";
 static char s_matter_qr_code[APP_QR_CODE_MAX] = "";
 static char s_matter_manual_code[APP_MANUAL_CODE_MAX] = "";
 static char s_matter_qr_url[APP_QR_URL_MAX] = "";
+static uint32_t s_matter_commissioned_count = 0;
+static bool s_matter_window_open = false;
+static uint32_t s_matter_last_event_ms = 0;
 static bool s_auto_update_busy = false;
 static bool s_auto_update_available = false;
 static char s_auto_update_status[APP_AUTO_UPDATE_STATUS_MAX] = "Published update checks are idle.";
@@ -224,6 +236,8 @@ input[type=file]{width:100%;padding:12px 14px;background:#091223;border:1px dash
 <div class="kv">
 <div class="kv-line"><span>Status</span><span id="overviewMatterStatus">Loading...</span></div>
 <div class="kv-line"><span>Endpoint</span><span id="overviewMatterEndpoint">-</span></div>
+<div class="kv-line"><span>Fabric Count</span><span id="overviewMatterFabricCount">-</span></div>
+<div class="kv-line"><span>Commissioning Window</span><span id="overviewMatterWindow">-</span></div>
 <div class="kv-line"><span>Manual Code</span><span id="overviewManualCode">-</span></div>
 <div class="kv-line"><span>QR Link</span><span><a class="link" id="overviewQrLink" href="#" target="_blank" rel="noopener">Unavailable</a></span></div>
 </div>
@@ -235,6 +249,10 @@ input[type=file]{width:100%;padding:12px 14px;background:#091223;border:1px dash
 <div class="kv-line"><span>Active AP SSID</span><span id="overviewApSsid">-</span></div>
 <div class="kv-line"><span>AP Web UI</span><span><a class="link" id="overviewApUrl" href="#" target="_blank" rel="noopener">Unavailable</a></span></div>
 <div class="kv-line"><span>Station Status</span><span id="overviewStaStatus">-</span></div>
+<div class="kv-line"><span>Station SSID</span><span id="overviewStaSsid">-</span></div>
+<div class="kv-line"><span>BSSID / Channel</span><span id="overviewStaBssid">-</span></div>
+<div class="kv-line"><span>Signal (RSSI)</span><span id="overviewStaRssi">-</span></div>
+<div class="kv-line"><span>Last Disconnect Reason</span><span id="overviewStaReason">-</span></div>
 <div class="kv-line"><span>LAN Web UI</span><span><a class="link" id="overviewLanUrl" href="#" target="_blank" rel="noopener">Unavailable</a></span></div>
 <div class="kv-line"><span>Restart Needed</span><span id="overviewApRestart">-</span></div>
 </div>
@@ -394,11 +412,17 @@ const otaBtn = document.getElementById('otaBtn');
 const otaStatus = document.getElementById('otaStatus');
 const overviewMatterStatus = document.getElementById('overviewMatterStatus');
 const overviewMatterEndpoint = document.getElementById('overviewMatterEndpoint');
+const overviewMatterFabricCount = document.getElementById('overviewMatterFabricCount');
+const overviewMatterWindow = document.getElementById('overviewMatterWindow');
 const overviewManualCode = document.getElementById('overviewManualCode');
 const overviewQrLink = document.getElementById('overviewQrLink');
 const overviewApSsid = document.getElementById('overviewApSsid');
 const overviewApUrl = document.getElementById('overviewApUrl');
 const overviewStaStatus = document.getElementById('overviewStaStatus');
+const overviewStaSsid = document.getElementById('overviewStaSsid');
+const overviewStaBssid = document.getElementById('overviewStaBssid');
+const overviewStaRssi = document.getElementById('overviewStaRssi');
+const overviewStaReason = document.getElementById('overviewStaReason');
 const overviewLanUrl = document.getElementById('overviewLanUrl');
 const overviewApRestart = document.getElementById('overviewApRestart');
 const overviewFwVersion = document.getElementById('overviewFwVersion');
@@ -444,7 +468,7 @@ function syncEffectControls(){const meta=EFFECT_META[selectedEffect]||EFFECT_MET
 function stashEffectControls(){const meta=EFFECT_META[selectedEffect]||EFFECT_META.solid;const values=getSelectedEffectValues();effectParamRows.forEach((slot,index)=>{if(!meta.params[index]){values[index]=0;return}values[index]=Number(slot.input.value);slot.value.textContent=slot.input.value});if((meta.colors||[])[0]){effectColors[selectedEffect]=normalizeHexColor(effectColor.value,getSelectedEffectColor())}}
 function updateControlReadout(){brightnessValue.textContent=controlBrightness.value;controlColorValue.textContent=controlColor.value.toUpperCase();if(effectColorRow.style.display!=='none'){effectColorValue.textContent=effectColor.value.toUpperCase()}}
 function setLink(linkEl,url,emptyLabel){if(url){linkEl.href=url;linkEl.textContent=url}else{linkEl.href='#';linkEl.textContent=emptyLabel||'Unavailable'}}
-function refreshOverview(data){overviewMatterStatus.textContent=data.commissioned?'Commissioned':'Ready to pair';overviewMatterEndpoint.textContent=data.matter_endpoint;overviewManualCode.textContent=data.manual_code||'Unavailable';setLink(overviewQrLink,data.qr_url,'Unavailable');overviewApSsid.textContent=data.ap_ssid||'-';setLink(overviewApUrl,data.ap_url||(data.ap_ip?('http://'+data.ap_ip):''),'Unavailable');overviewStaStatus.textContent=data.sta_connected?'Connected':'Not connected';setLink(overviewLanUrl,data.lan_url||(data.sta_ip?('http://'+data.sta_ip):''),'Not connected');overviewApRestart.textContent=data.ap_restart_required?'Yes, reset to apply new AP config':'No';overviewFwVersion.textContent=data.fw_version||'unknown';overviewRunningPartition.textContent=data.running_partition||'-';overviewNextPartition.textContent=data.ota_target_partition||'-';overviewRevertTarget.textContent=data.revert_available?((data.revert_version||'unknown')+' @ '+(data.revert_partition||'')):'No previous firmware available';overviewPublishedVersion.textContent=data.auto_update_latest_version||'Unknown';overviewUpdateStatus.textContent=data.auto_update_status||'Idle'}
+function refreshOverview(data){overviewMatterStatus.textContent=data.commissioned?'Commissioned':'Ready to pair';overviewMatterEndpoint.textContent=data.matter_endpoint;overviewMatterFabricCount.textContent=(data.matter_fabric_count??'-');overviewMatterWindow.textContent=data.matter_window_open?'Open':'Closed';overviewManualCode.textContent=data.manual_code||'Unavailable';setLink(overviewQrLink,data.qr_url,'Unavailable');overviewApSsid.textContent=data.ap_ssid||'-';setLink(overviewApUrl,data.ap_url||(data.ap_ip?('http://'+data.ap_ip):''),'Unavailable');overviewStaStatus.textContent=data.sta_connected?'Connected':'Not connected';overviewStaSsid.textContent=data.sta_ssid||'-';overviewStaBssid.textContent=(data.sta_bssid||'-')+(data.sta_channel?(' / ch '+data.sta_channel):'');overviewStaRssi.textContent=(data.sta_rssi||data.sta_rssi===0)?(data.sta_rssi+' dBm'):'-';overviewStaReason.textContent=(data.sta_last_disconnect_reason&&data.sta_last_disconnect_reason!==0)?((data.sta_last_disconnect_reason_text||'unknown')+' ('+String(data.sta_last_disconnect_reason)+')'):'None';setLink(overviewLanUrl,data.lan_url||(data.sta_ip?('http://'+data.sta_ip):''),'Not connected');overviewApRestart.textContent=data.ap_restart_required?'Yes, reset to apply new AP config':'No';overviewFwVersion.textContent=data.fw_version||'unknown';overviewRunningPartition.textContent=data.running_partition||'-';overviewNextPartition.textContent=data.ota_target_partition||'-';overviewRevertTarget.textContent=data.revert_available?((data.revert_version||'unknown')+' @ '+(data.revert_partition||'')):'No previous firmware available';overviewPublishedVersion.textContent=data.auto_update_latest_version||'Unknown';overviewUpdateStatus.textContent=data.auto_update_status||'Idle'}
 function refreshFirmwarePanel(data){const cur=data.fw_version||'unknown';const avail=data.auto_update_latest_version||'';firmwareCurrentVersion.textContent=cur;firmwareAvailableVersion.textContent=avail?avail:'No update available';const canInstall=!!data.auto_update_available && !data.auto_update_busy && avail && avail!==cur;installUpdateBtn.disabled=!canInstall;installUpdateBtn.textContent=data.auto_update_busy?'Installing...':(canInstall?('Install Update '+avail):'Install Update');updateStatusLine.textContent=data.auto_update_status||'Idle'}
 function setOtaBusy(busy){otaBtn.disabled=busy;otaFile.disabled=busy;otaBtn.textContent=busy?'Uploading OTA...':'Install OTA Update'}
 function applyStateToUi(data){effectProfiles=normalizeEffectProfiles(data.effect_profiles);effectColors=normalizeEffectColors(data.effect_colors);selectedEffect=data.effect||'solid';syncConfigCount(data.count);configCount.max=data.max_leds;configCountNumber.max=data.max_leds;configApSsid.value=data.config_ap_ssid||data.ap_ssid||'';configApPassword.value=data.config_ap_password||'';controlBrightness.value=data.brightness;controlColor.value=data.color;revertBtn.disabled=!data.revert_available;refreshOverview(data);refreshFirmwarePanel(data);otaStatus.textContent='Next OTA slot: '+(data.ota_target_partition||'unknown')+'. Upload build/esp32c6_led_web.bin after the first USB flash.';syncEffectControls();updateControlReadout()}
@@ -558,6 +582,48 @@ static void copy_string_value(char *dest, size_t dest_size, const char *src)
     size_t copy_len = std::min(dest_size - 1, std::strlen(src));
     std::memcpy(dest, src, copy_len);
     dest[copy_len] = '\0';
+}
+
+static const char *wifi_disconnect_reason_to_text(uint16_t reason)
+{
+    switch (reason) {
+    case 0:
+        return "none";
+    case 2:
+        return "auth-expire";
+    case 3:
+        return "auth-leave";
+    case 4:
+        return "assoc-expire";
+    case 5:
+        return "assoc-too-many";
+    case 6:
+        return "not-authenticated";
+    case 7:
+        return "not-associated";
+    case 8:
+        return "assoc-leave";
+    case 15:
+        return "4way-timeout";
+    case 16:
+        return "group-key-timeout";
+    case 23:
+        return "802.1x-auth-failed";
+    case 200:
+        return "beacon-timeout";
+    case 201:
+        return "no-ap-found";
+    case 202:
+        return "auth-failed";
+    case 203:
+        return "assoc-failed";
+    case 204:
+        return "handshake-timeout";
+    case 205:
+        return "connection-failed";
+    default:
+        return "unknown";
+    }
 }
 
 typedef struct {
@@ -754,6 +820,11 @@ static esp_err_t verify_manifest_signature(const uint8_t *msg, size_t msg_len,
 #endif
 }
 
+// IDF's streaming HTTP client (open + fetch_headers + read) doesn't auto-
+// follow redirects, but GitHub's /releases/latest/download/... URLs return
+// 302 to an S3 asset URL. Follow up to 5 redirects manually.
+static constexpr int kMaxHttpRedirects = 5;
+
 static esp_err_t fetch_https_bytes(const char *url, uint8_t **buf_out, size_t *len_out, size_t max_size,
                                     const char *accept)
 {
@@ -779,14 +850,40 @@ static esp_err_t fetch_https_bytes(const char *url, uint8_t **buf_out, size_t *l
         esp_http_client_set_header(client, "Accept", accept);
     }
 
-    esp_err_t err = esp_http_client_open(client, 0);
-    if (err != ESP_OK) {
-        esp_http_client_cleanup(client);
-        return err;
+    int redirects = 0;
+    int status_code = 0;
+    while (true) {
+        esp_err_t err = esp_http_client_open(client, 0);
+        if (err != ESP_OK) {
+            esp_http_client_cleanup(client);
+            return err;
+        }
+        int headers_rc = esp_http_client_fetch_headers(client);
+        if (headers_rc < 0) {
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+            return ESP_FAIL;
+        }
+        status_code = esp_http_client_get_status_code(client);
+        if (status_code == 301 || status_code == 302 || status_code == 303 ||
+            status_code == 307 || status_code == 308) {
+            if (++redirects > kMaxHttpRedirects) {
+                ESP_LOGW(TAG, "Too many redirects fetching %s", url);
+                esp_http_client_close(client);
+                esp_http_client_cleanup(client);
+                return ESP_FAIL;
+            }
+            // set_redirection() reads Location and updates the client URL;
+            // the next open() targets the redirected endpoint.
+            esp_http_client_set_redirection(client);
+            esp_http_client_close(client);
+            continue;
+        }
+        break;
     }
 
-    int headers_rc = esp_http_client_fetch_headers(client);
-    if (headers_rc < 0) {
+    if (status_code != 200) {
+        ESP_LOGW(TAG, "HTTP %d for %s", status_code, url);
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
         return ESP_FAIL;
@@ -818,15 +915,9 @@ static esp_err_t fetch_https_bytes(const char *url, uint8_t **buf_out, size_t *l
         total += static_cast<size_t>(read);
     }
 
-    int status_code = esp_http_client_get_status_code(client);
     buf[total] = '\0';
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
-    if (status_code != 200) {
-        ESP_LOGW(TAG, "HTTP %d for %s", status_code, url);
-        free(buf);
-        return ESP_FAIL;
-    }
 
     *buf_out = buf;
     *len_out = total;
@@ -2217,6 +2308,8 @@ static esp_err_t send_state_json(httpd_req_t *req)
     cJSON_AddBoolToObject(root, "matter_ready", matter_is_ready());
     cJSON_AddBoolToObject(root, "commissioned", matter_is_commissioned());
     cJSON_AddNumberToObject(root, "matter_endpoint", s_light_endpoint_id);
+    cJSON_AddNumberToObject(root, "matter_fabric_count", static_cast<double>(chip::Server::GetInstance().GetFabricTable().FabricCount()));
+    cJSON_AddBoolToObject(root, "matter_window_open", s_matter_window_open);
     cJSON_AddStringToObject(root, "fw_version", app_desc ? app_desc->version : "unknown");
     cJSON_AddStringToObject(root, "running_partition", running_partition ? running_partition->label : "");
     cJSON_AddStringToObject(root, "ota_target_partition", ota_target_partition ? ota_target_partition->label : "");
@@ -2227,6 +2320,18 @@ static esp_err_t send_state_json(httpd_req_t *req)
     cJSON_AddBoolToObject(root, "auto_update_available", auto_update_available);
     cJSON_AddStringToObject(root, "auto_update_status", auto_update_status);
     cJSON_AddStringToObject(root, "auto_update_latest_version", auto_update_latest_version);
+    cJSON_AddStringToObject(root, "sta_ssid", s_sta_ssid);
+    cJSON_AddStringToObject(root, "sta_bssid", s_sta_bssid);
+    cJSON_AddNumberToObject(root, "sta_rssi", s_sta_rssi);
+    cJSON_AddNumberToObject(root, "sta_channel", s_sta_channel);
+    cJSON_AddNumberToObject(root, "sta_last_disconnect_reason", s_sta_last_disconnect_reason);
+    cJSON_AddStringToObject(root, "sta_last_disconnect_reason_text", wifi_disconnect_reason_to_text(s_sta_last_disconnect_reason));
+    cJSON_AddNumberToObject(root, "sta_connect_count", static_cast<double>(s_sta_connect_count));
+    cJSON_AddNumberToObject(root, "sta_disconnect_count", static_cast<double>(s_sta_disconnect_count));
+    cJSON_AddNumberToObject(root, "sta_last_event_ms", static_cast<double>(s_sta_last_event_ms));
+    cJSON_AddNumberToObject(root, "sta_last_ip_ms", static_cast<double>(s_sta_last_ip_ms));
+    cJSON_AddNumberToObject(root, "matter_commissioned_count", static_cast<double>(s_matter_commissioned_count));
+    cJSON_AddNumberToObject(root, "matter_last_event_ms", static_cast<double>(s_matter_last_event_ms));
     cJSON_AddStringToObject(root, "manual_code", s_matter_manual_code);
     cJSON_AddStringToObject(root, "qr_code", s_matter_qr_code);
     cJSON_AddStringToObject(root, "qr_url", s_matter_qr_url);
@@ -2975,9 +3080,28 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         break;
     }
     case WIFI_EVENT_STA_CONNECTED:
+        s_sta_connect_count++;
+        s_sta_last_event_ms = esp_log_timestamp();
+        s_sta_last_disconnect_reason = 0;
+        {
+            wifi_ap_record_t ap_info = {};
+            if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+                copy_string_value(s_sta_ssid, sizeof(s_sta_ssid), reinterpret_cast<const char *>(ap_info.ssid));
+                std::snprintf(s_sta_bssid, sizeof(s_sta_bssid), MACSTR, MAC2STR(ap_info.bssid));
+                s_sta_rssi = ap_info.rssi;
+                s_sta_channel = ap_info.primary;
+            }
+        }
         ESP_LOGI(TAG, "Matter station connected to upstream Wi-Fi");
         break;
     case WIFI_EVENT_STA_DISCONNECTED:
+        s_sta_disconnect_count++;
+        s_sta_last_event_ms = esp_log_timestamp();
+        if (event_data) {
+            auto *event = static_cast<wifi_event_sta_disconnected_t *>(event_data);
+            s_sta_last_disconnect_reason = event->reason;
+            ESP_LOGW(TAG, "Matter station disconnected, reason=%u", static_cast<unsigned int>(event->reason));
+        }
         s_sta_ip[0] = '\0';
         set_auto_update_state(false, false, s_auto_update_latest_version, s_auto_update_asset_url,
                               "Waiting for LAN Wi-Fi before checking published updates.");
@@ -2998,6 +3122,7 @@ static void ip_event_handler(void *arg, esp_event_base_t event_base, int32_t eve
     if (event_id == IP_EVENT_STA_GOT_IP) {
         auto *event = static_cast<ip_event_got_ip_t *>(event_data);
         std::snprintf(s_sta_ip, sizeof(s_sta_ip), IPSTR, IP2STR(&event->ip_info.ip));
+        s_sta_last_ip_ms = esp_log_timestamp();
         ESP_LOGI(TAG, "Matter station IP: %s", s_sta_ip);
         ESP_LOGI(TAG, "LAN web UI available at http://%s", s_sta_ip);
         if (s_auto_update_task) {
@@ -3229,8 +3354,10 @@ static void configure_matter_node()
 static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
 {
     (void) arg;
+    s_matter_last_event_ms = esp_log_timestamp();
     switch (event->Type) {
     case chip::DeviceLayer::DeviceEventType::kCommissioningComplete:
+        s_matter_commissioned_count++;
         ESP_LOGI(TAG, "Matter commissioning complete");
         refresh_ip_strings();
         break;
@@ -3244,12 +3371,14 @@ static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
         break;
 
     case chip::DeviceLayer::DeviceEventType::kCommissioningWindowOpened:
+        s_matter_window_open = true;
         ESP_LOGI(TAG, "Matter commissioning window opened");
         refresh_matter_onboarding_data();
         PrintOnboardingCodes(chip::RendezvousInformationFlags(chip::RendezvousInformationFlag::kBLE));
         break;
 
     case chip::DeviceLayer::DeviceEventType::kCommissioningWindowClosed:
+        s_matter_window_open = false;
         ESP_LOGI(TAG, "Matter commissioning window closed");
         break;
 
