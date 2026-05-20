@@ -4,6 +4,13 @@ on:
   release:
     types:
       - published
+  # Build (without publishing) on every push to main so the build cache is
+  # populated under the default-branch scope. Release events on tags then
+  # restore the cache from main, which is the only cross-ref fallback
+  # GitHub Actions allows.
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 env:
