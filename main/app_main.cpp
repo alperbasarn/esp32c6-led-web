@@ -841,6 +841,10 @@ static esp_err_t fetch_https_bytes(const char *url, uint8_t **buf_out, size_t *l
     config.crt_bundle_attach = esp_crt_bundle_attach;
     config.user_agent = APP_UPDATE_USER_AGENT;
     config.keep_alive_enable = true;
+    // S3 (the GitHub-release redirect target) sends large response headers
+    // including auth tokens. IDF's default 512-byte buffer overflows.
+    config.buffer_size = 4096;
+    config.buffer_size_tx = 1024;
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
@@ -1177,6 +1181,10 @@ static esp_err_t install_https_ota_with_verify(const published_update_info_t *in
     http_config.transport_type = HTTP_TRANSPORT_OVER_SSL;
     http_config.crt_bundle_attach = esp_crt_bundle_attach;
     http_config.user_agent = APP_UPDATE_USER_AGENT;
+    // S3 (redirect target for GitHub release assets) sends large response
+    // headers; the default 512-byte buffer overflows.
+    http_config.buffer_size = 4096;
+    http_config.buffer_size_tx = 1024;
     http_config.keep_alive_enable = true;
 
     esp_https_ota_config_t ota_config = {};
