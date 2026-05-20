@@ -856,16 +856,36 @@ static esp_err_t fetch_https_bytes(const char *url, uint8_t **buf_out, size_t *l
         esp_http_client_set_header(client, "Accept", accept);
     }
 
+    // GitHub occasionally resets the TLS connection (MBEDTLS_ERR_NET_CONN_RESET)
+    // on rapid back-to-back requests. Treat open/fetch_headers as retryable.
+    constexpr int kMaxTransientRetries = 2;
     int redirects = 0;
+    int retries = 0;
     int status_code = 0;
+    esp_err_t last_err = ESP_OK;
     while (true) {
         esp_err_t err = esp_http_client_open(client, 0);
         if (err != ESP_OK) {
+            last_err = err;
+            if (++retries <= kMaxTransientRetries) {
+                ESP_LOGW(TAG, "HTTP open failed (%s); retry %d/%d after backoff",
+                         esp_err_to_name(err), retries, kMaxTransientRetries);
+                vTaskDelay(pdMS_TO_TICKS(750));
+                continue;
+            }
             esp_http_client_cleanup(client);
             return err;
         }
         int headers_rc = esp_http_client_fetch_headers(client);
         if (headers_rc < 0) {
+            last_err = ESP_FAIL;
+            if (++retries <= kMaxTransientRetries) {
+                ESP_LOGW(TAG, "fetch_headers failed; retry %d/%d after backoff",
+                         retries, kMaxTransientRetries);
+                esp_http_client_close(client);
+                vTaskDelay(pdMS_TO_TICKS(750));
+                continue;
+            }
             esp_http_client_close(client);
             esp_http_client_cleanup(client);
             return ESP_FAIL;
@@ -887,6 +907,7 @@ static esp_err_t fetch_https_bytes(const char *url, uint8_t **buf_out, size_t *l
         }
         break;
     }
+    (void) last_err;
 
     if (status_code != 200) {
         ESP_LOGW(TAG, "HTTP %d for %s", status_code, url);
@@ -962,9 +983,10 @@ static esp_err_t fetch_latest_published_update(published_update_info_t *info)
         size_t   sig_len = 0;
         err = fetch_https_bytes(sig_url, &sig_bytes, &sig_len, APP_AUTO_UPDATE_SIG_LIMIT, "application/octet-stream");
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Could not fetch manifest signature");
+            ESP_LOGE(TAG, "Could not fetch manifest signature: %s", esp_err_to_name(err));
             free(manifest_bytes);
-            return ESP_ERR_NOT_FOUND;
+            // Distinct from "asset URL missing" so the UI message is accurate.
+            return ESP_ERR_HTTP_CONNECT;
         }
         err = verify_manifest_signature(manifest_bytes, manifest_len, sig_bytes, sig_len);
         free(sig_bytes);
@@ -1351,6 +1373,9 @@ static void run_published_update_check(published_update_mode_t mode)
             set_auto_update_state(false, false, "", "", "The latest GitHub release metadata was invalid.");
         } else if (err == ESP_ERR_INVALID_CRC) {
             set_auto_update_state(false, false, "", "", "The latest release manifest signature did not verify.");
+        } else if (err == ESP_ERR_HTTP_CONNECT) {
+            set_auto_update_state(false, false, "", "",
+                                  "Could not download the manifest signature — try again in a moment.");
         } else {
             set_auto_update_state(false, false, "", "", "Failed to fetch the latest published firmware.");
         }
