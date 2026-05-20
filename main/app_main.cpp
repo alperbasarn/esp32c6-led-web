@@ -23,6 +23,8 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_ota_ops.h"
+#include "esp_partition.h"
+#include "esp_random.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
@@ -30,8 +32,12 @@
 #include "freertos/task.h"
 #include "led_strip.h"
 #include "lwip/inet.h"
+#include "mbedtls/pk.h"
+#include "mbedtls/sha256.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+
+#include "release_pubkey.h"
 
 #include <app/server/CommissioningWindowManager.h>
 #include <app/server/Server.h>
@@ -44,8 +50,8 @@
 #define APP_WIFI_CHANNEL         6
 #define APP_WIFI_MAX_STA_CONN    4
 
-#define APP_LED_GPIO             17
-#define APP_LED_MAX_PIXELS       120
+#define APP_LED_GPIO             CONFIG_APP_LED_GPIO
+#define APP_LED_MAX_PIXELS       CONFIG_APP_LED_MAX_PIXELS
 #define APP_LED_DEFAULT_COUNT    8
 #define APP_LED_DEFAULT_RED      255
 #define APP_LED_DEFAULT_GREEN    96
@@ -59,15 +65,21 @@
 #define APP_QR_CODE_MAX          128
 #define APP_MANUAL_CODE_MAX      32
 #define APP_QR_URL_MAX           256
-#define APP_AUTO_UPDATE_DEFAULT  1
 #define APP_AUTO_UPDATE_STATUS_MAX 160
 #define APP_AUTO_UPDATE_VERSION_MAX 32
 #define APP_AUTO_UPDATE_URL_MAX  384
 #define APP_AUTO_UPDATE_JSON_LIMIT 16384
-#define APP_AUTO_UPDATE_INTERVAL_MS (6ULL * 60ULL * 60ULL * 1000ULL)
-#define APP_UPDATE_RELEASE_API_URL "https://api.github.com/repos/ReggaeShark2001/esp32c6-led-web/releases/latest"
-#define APP_UPDATE_ASSET_NAME    "esp32c6_led_web.bin"
+#define APP_AUTO_UPDATE_SIG_LIMIT  256
+#define APP_AUTO_UPDATE_INTERVAL_MS  ((uint64_t)CONFIG_APP_UPDATE_INTERVAL_HOURS * 60ULL * 60ULL * 1000ULL)
+#define APP_AUTO_UPDATE_JITTER_MS    ((uint64_t)CONFIG_APP_UPDATE_INITIAL_JITTER_MIN * 60ULL * 1000ULL)
+#define APP_UPDATE_RELEASE_REPO  CONFIG_APP_RELEASE_REPO
+#define APP_UPDATE_ASSET_NAME    CONFIG_APP_RELEASE_ASSET_NAME
+#define APP_UPDATE_MANIFEST_NAME CONFIG_APP_RELEASE_MANIFEST_NAME
+#define APP_UPDATE_MANIFEST_SIG_NAME CONFIG_APP_RELEASE_MANIFEST_SIG_NAME
 #define APP_UPDATE_USER_AGENT    "esp32c6-led-web"
+#define APP_UPDATE_SHA256_HEX_LEN 64
+#define APP_UPDATE_SELF_TEST_TIMEOUT_MS ((uint64_t)CONFIG_APP_UPDATE_SELF_TEST_TIMEOUT_S * 1000ULL)
+#define APP_UPDATE_OTA_BUF_SIZE  1024
 
 static const char *TAG = "matter_led";
 static constexpr auto kCommissioningTimeoutSeconds = 300;
@@ -156,6 +168,15 @@ static bool s_syncing_matter = false;
 static bool s_network_handlers_registered = false;
 static char s_ap_ip[16] = "192.168.4.1";
 static char s_sta_ip[16] = "";
+static char s_sta_ssid[33] = "";
+static char s_sta_bssid[18] = "";
+static int s_sta_rssi = 0;
+static uint8_t s_sta_channel = 0;
+static uint16_t s_sta_last_disconnect_reason = 0;
+static uint32_t s_sta_connect_count = 0;
+static uint32_t s_sta_disconnect_count = 0;
+static uint32_t s_sta_last_event_ms = 0;
+static uint32_t s_sta_last_ip_ms = 0;
 static char s_ap_ssid[33] = "";
 static char s_ap_password[65] = "";
 static char s_runtime_ap_ssid[33] = "";
@@ -163,7 +184,9 @@ static char s_runtime_ap_password[65] = "";
 static char s_matter_qr_code[APP_QR_CODE_MAX] = "";
 static char s_matter_manual_code[APP_MANUAL_CODE_MAX] = "";
 static char s_matter_qr_url[APP_QR_URL_MAX] = "";
-static bool s_auto_update_enabled = APP_AUTO_UPDATE_DEFAULT != 0;
+static uint32_t s_matter_commissioned_count = 0;
+static bool s_matter_window_open = false;
+static uint32_t s_matter_last_event_ms = 0;
 static bool s_auto_update_busy = false;
 static bool s_auto_update_available = false;
 static char s_auto_update_status[APP_AUTO_UPDATE_STATUS_MAX] = "Published update checks are idle.";
@@ -213,6 +236,8 @@ input[type=file]{width:100%;padding:12px 14px;background:#091223;border:1px dash
 <div class="kv">
 <div class="kv-line"><span>Status</span><span id="overviewMatterStatus">Loading...</span></div>
 <div class="kv-line"><span>Endpoint</span><span id="overviewMatterEndpoint">-</span></div>
+<div class="kv-line"><span>Fabric Count</span><span id="overviewMatterFabricCount">-</span></div>
+<div class="kv-line"><span>Commissioning Window</span><span id="overviewMatterWindow">-</span></div>
 <div class="kv-line"><span>Manual Code</span><span id="overviewManualCode">-</span></div>
 <div class="kv-line"><span>QR Link</span><span><a class="link" id="overviewQrLink" href="#" target="_blank" rel="noopener">Unavailable</a></span></div>
 </div>
@@ -224,6 +249,10 @@ input[type=file]{width:100%;padding:12px 14px;background:#091223;border:1px dash
 <div class="kv-line"><span>Active AP SSID</span><span id="overviewApSsid">-</span></div>
 <div class="kv-line"><span>AP Web UI</span><span><a class="link" id="overviewApUrl" href="#" target="_blank" rel="noopener">Unavailable</a></span></div>
 <div class="kv-line"><span>Station Status</span><span id="overviewStaStatus">-</span></div>
+<div class="kv-line"><span>Station SSID</span><span id="overviewStaSsid">-</span></div>
+<div class="kv-line"><span>BSSID / Channel</span><span id="overviewStaBssid">-</span></div>
+<div class="kv-line"><span>Signal (RSSI)</span><span id="overviewStaRssi">-</span></div>
+<div class="kv-line"><span>Last Disconnect Reason</span><span id="overviewStaReason">-</span></div>
 <div class="kv-line"><span>LAN Web UI</span><span><a class="link" id="overviewLanUrl" href="#" target="_blank" rel="noopener">Unavailable</a></span></div>
 <div class="kv-line"><span>Restart Needed</span><span id="overviewApRestart">-</span></div>
 </div>
@@ -235,8 +264,7 @@ input[type=file]{width:100%;padding:12px 14px;background:#091223;border:1px dash
 <div class="kv-line"><span>Running Slot</span><span id="overviewRunningPartition">-</span></div>
 <div class="kv-line"><span>Next OTA Slot</span><span id="overviewNextPartition">-</span></div>
 <div class="kv-line"><span>Revert Target</span><span id="overviewRevertTarget">-</span></div>
-<div class="kv-line"><span>Auto Update</span><span id="overviewAutoUpdate">-</span></div>
-<div class="kv-line"><span>Published Version</span><span id="overviewPublishedVersion">-</span></div>
+<div class="kv-line"><span>Available Version</span><span id="overviewPublishedVersion">-</span></div>
 <div class="kv-line"><span>Update Status</span><span id="overviewUpdateStatus">-</span></div>
 </div>
 </div>
@@ -264,7 +292,6 @@ input[type=file]{width:100%;padding:12px 14px;background:#091223;border:1px dash
 <div class="label"><span>AP Password</span><span class="value">8-63 chars</span></div>
 <input id="configApPassword" type="password" maxlength="63" value="">
 </div>
-<label class="toggle"><span>Auto Update From Published Release</span><input id="configAutoUpdate" type="checkbox"></label>
 </div>
 <div class="actions">
 <button class="btn btn-primary" id="saveConfigBtn">Save Configuration</button>
@@ -277,11 +304,21 @@ input[type=file]{width:100%;padding:12px 14px;background:#091223;border:1px dash
 <h2>Firmware Actions</h2>
 <div class="pairing">
 <h2>Firmware Update</h2>
-<p>Upload a new application binary from this project to install it into the inactive OTA slot. The device will reboot automatically after a successful update.</p>
+<p>Updates are user-triggered. The device periodically checks for a newer release; when one is available, press <strong>Install Update</strong> to apply it.</p>
+<div class="kv" style="margin-bottom:12px">
+<div class="kv-line"><span>Current</span><span id="firmwareCurrentVersion">-</span></div>
+<div class="kv-line"><span>Available</span><span id="firmwareAvailableVersion">-</span></div>
+</div>
+<div class="actions">
+<button class="btn btn-primary" id="installUpdateBtn" disabled>Install Update</button>
+<button class="btn btn-secondary" id="checkUpdateBtn">Check For Updates</button>
+</div>
+<p class="footer" id="updateStatusLine">Press <em>Check For Updates</em> to query GitHub now.</p>
+<hr style="border:none;border-top:1px solid var(--line);margin:14px 0">
+<p>Or upload a build of this project to install from your own binary.</p>
 <input id="otaFile" type="file" accept=".bin,application/octet-stream">
 <div class="actions">
-<button class="btn btn-secondary" id="otaBtn">Install OTA Update</button>
-<button class="btn btn-secondary" id="checkUpdateBtn">Check Published Update Now</button>
+<button class="btn btn-secondary" id="otaBtn">Install From File</button>
 </div>
 <p class="footer" id="otaStatus">Use <code>build/esp32c6_led_web.bin</code> after the first USB flash.</p>
 </div>
@@ -359,7 +396,6 @@ const configCountNumber = document.getElementById('configCountNumber');
 const configCountValue = document.getElementById('configCountValue');
 const configApSsid = document.getElementById('configApSsid');
 const configApPassword = document.getElementById('configApPassword');
-const configAutoUpdate = document.getElementById('configAutoUpdate');
 const controlBrightness = document.getElementById('controlBrightness');
 const controlColor = document.getElementById('controlColor');
 const controlColorValue = document.getElementById('controlColorValue');
@@ -376,20 +412,29 @@ const otaBtn = document.getElementById('otaBtn');
 const otaStatus = document.getElementById('otaStatus');
 const overviewMatterStatus = document.getElementById('overviewMatterStatus');
 const overviewMatterEndpoint = document.getElementById('overviewMatterEndpoint');
+const overviewMatterFabricCount = document.getElementById('overviewMatterFabricCount');
+const overviewMatterWindow = document.getElementById('overviewMatterWindow');
 const overviewManualCode = document.getElementById('overviewManualCode');
 const overviewQrLink = document.getElementById('overviewQrLink');
 const overviewApSsid = document.getElementById('overviewApSsid');
 const overviewApUrl = document.getElementById('overviewApUrl');
 const overviewStaStatus = document.getElementById('overviewStaStatus');
+const overviewStaSsid = document.getElementById('overviewStaSsid');
+const overviewStaBssid = document.getElementById('overviewStaBssid');
+const overviewStaRssi = document.getElementById('overviewStaRssi');
+const overviewStaReason = document.getElementById('overviewStaReason');
 const overviewLanUrl = document.getElementById('overviewLanUrl');
 const overviewApRestart = document.getElementById('overviewApRestart');
 const overviewFwVersion = document.getElementById('overviewFwVersion');
 const overviewRunningPartition = document.getElementById('overviewRunningPartition');
 const overviewNextPartition = document.getElementById('overviewNextPartition');
 const overviewRevertTarget = document.getElementById('overviewRevertTarget');
-const overviewAutoUpdate = document.getElementById('overviewAutoUpdate');
 const overviewPublishedVersion = document.getElementById('overviewPublishedVersion');
 const overviewUpdateStatus = document.getElementById('overviewUpdateStatus');
+const firmwareCurrentVersion = document.getElementById('firmwareCurrentVersion');
+const firmwareAvailableVersion = document.getElementById('firmwareAvailableVersion');
+const updateStatusLine = document.getElementById('updateStatusLine');
+const installUpdateBtn = document.getElementById('installUpdateBtn');
 const saveConfigBtn = document.getElementById('saveConfigBtn');
 const saveControlBtn = document.getElementById('saveControlBtn');
 const rebootBtn = document.getElementById('rebootBtn');
@@ -423,15 +468,17 @@ function syncEffectControls(){const meta=EFFECT_META[selectedEffect]||EFFECT_MET
 function stashEffectControls(){const meta=EFFECT_META[selectedEffect]||EFFECT_META.solid;const values=getSelectedEffectValues();effectParamRows.forEach((slot,index)=>{if(!meta.params[index]){values[index]=0;return}values[index]=Number(slot.input.value);slot.value.textContent=slot.input.value});if((meta.colors||[])[0]){effectColors[selectedEffect]=normalizeHexColor(effectColor.value,getSelectedEffectColor())}}
 function updateControlReadout(){brightnessValue.textContent=controlBrightness.value;controlColorValue.textContent=controlColor.value.toUpperCase();if(effectColorRow.style.display!=='none'){effectColorValue.textContent=effectColor.value.toUpperCase()}}
 function setLink(linkEl,url,emptyLabel){if(url){linkEl.href=url;linkEl.textContent=url}else{linkEl.href='#';linkEl.textContent=emptyLabel||'Unavailable'}}
-function refreshOverview(data){overviewMatterStatus.textContent=data.commissioned?'Commissioned':'Ready to pair';overviewMatterEndpoint.textContent=data.matter_endpoint;overviewManualCode.textContent=data.manual_code||'Unavailable';setLink(overviewQrLink,data.qr_url,'Unavailable');overviewApSsid.textContent=data.ap_ssid||'-';setLink(overviewApUrl,data.ap_url||(data.ap_ip?('http://'+data.ap_ip):''),'Unavailable');overviewStaStatus.textContent=data.sta_connected?'Connected':'Not connected';setLink(overviewLanUrl,data.lan_url||(data.sta_ip?('http://'+data.sta_ip):''),'Not connected');overviewApRestart.textContent=data.ap_restart_required?'Yes, reset to apply new AP config':'No';overviewFwVersion.textContent=data.fw_version||'unknown';overviewRunningPartition.textContent=data.running_partition||'-';overviewNextPartition.textContent=data.ota_target_partition||'-';overviewRevertTarget.textContent=data.revert_available?((data.revert_version||'unknown')+' @ '+(data.revert_partition||'')):'No previous firmware available';overviewAutoUpdate.textContent=data.auto_update_enabled?'Enabled':'Disabled';overviewPublishedVersion.textContent=data.auto_update_latest_version||'Unknown';overviewUpdateStatus.textContent=data.auto_update_status||'Idle'}
+function refreshOverview(data){overviewMatterStatus.textContent=data.commissioned?'Commissioned':'Ready to pair';overviewMatterEndpoint.textContent=data.matter_endpoint;overviewMatterFabricCount.textContent=(data.matter_fabric_count??'-');overviewMatterWindow.textContent=data.matter_window_open?'Open':'Closed';overviewManualCode.textContent=data.manual_code||'Unavailable';setLink(overviewQrLink,data.qr_url,'Unavailable');overviewApSsid.textContent=data.ap_ssid||'-';setLink(overviewApUrl,data.ap_url||(data.ap_ip?('http://'+data.ap_ip):''),'Unavailable');overviewStaStatus.textContent=data.sta_connected?'Connected':'Not connected';overviewStaSsid.textContent=data.sta_ssid||'-';overviewStaBssid.textContent=(data.sta_bssid||'-')+(data.sta_channel?(' / ch '+data.sta_channel):'');overviewStaRssi.textContent=(data.sta_rssi||data.sta_rssi===0)?(data.sta_rssi+' dBm'):'-';overviewStaReason.textContent=(data.sta_last_disconnect_reason&&data.sta_last_disconnect_reason!==0)?((data.sta_last_disconnect_reason_text||'unknown')+' ('+String(data.sta_last_disconnect_reason)+')'):'None';setLink(overviewLanUrl,data.lan_url||(data.sta_ip?('http://'+data.sta_ip):''),'Not connected');overviewApRestart.textContent=data.ap_restart_required?'Yes, reset to apply new AP config':'No';overviewFwVersion.textContent=data.fw_version||'unknown';overviewRunningPartition.textContent=data.running_partition||'-';overviewNextPartition.textContent=data.ota_target_partition||'-';overviewRevertTarget.textContent=data.revert_available?((data.revert_version||'unknown')+' @ '+(data.revert_partition||'')):'No previous firmware available';overviewPublishedVersion.textContent=data.auto_update_latest_version||'Unknown';overviewUpdateStatus.textContent=data.auto_update_status||'Idle'}
+function refreshFirmwarePanel(data){const cur=data.fw_version||'unknown';const avail=data.auto_update_latest_version||'';firmwareCurrentVersion.textContent=cur;firmwareAvailableVersion.textContent=avail?avail:'No update available';const canInstall=!!data.auto_update_available && !data.auto_update_busy && avail && avail!==cur;installUpdateBtn.disabled=!canInstall;installUpdateBtn.textContent=data.auto_update_busy?'Installing...':(canInstall?('Install Update '+avail):'Install Update');updateStatusLine.textContent=data.auto_update_status||'Idle'}
 function setOtaBusy(busy){otaBtn.disabled=busy;otaFile.disabled=busy;otaBtn.textContent=busy?'Uploading OTA...':'Install OTA Update'}
-function applyStateToUi(data){effectProfiles=normalizeEffectProfiles(data.effect_profiles);effectColors=normalizeEffectColors(data.effect_colors);selectedEffect=data.effect||'solid';syncConfigCount(data.count);configCount.max=data.max_leds;configCountNumber.max=data.max_leds;configApSsid.value=data.config_ap_ssid||data.ap_ssid||'';configApPassword.value=data.config_ap_password||'';configAutoUpdate.checked=!!data.auto_update_enabled;controlBrightness.value=data.brightness;controlColor.value=data.color;revertBtn.disabled=!data.revert_available;refreshOverview(data);otaStatus.textContent='Next OTA slot: '+(data.ota_target_partition||'unknown')+'. Upload build/esp32c6_led_web.bin after the first USB flash.';syncEffectControls();updateControlReadout()}
+function applyStateToUi(data){effectProfiles=normalizeEffectProfiles(data.effect_profiles);effectColors=normalizeEffectColors(data.effect_colors);selectedEffect=data.effect||'solid';syncConfigCount(data.count);configCount.max=data.max_leds;configCountNumber.max=data.max_leds;configApSsid.value=data.config_ap_ssid||data.ap_ssid||'';configApPassword.value=data.config_ap_password||'';controlBrightness.value=data.brightness;controlColor.value=data.color;revertBtn.disabled=!data.revert_available;refreshOverview(data);refreshFirmwarePanel(data);otaStatus.textContent='Next OTA slot: '+(data.ota_target_partition||'unknown')+'. Upload build/esp32c6_led_web.bin after the first USB flash.';syncEffectControls();updateControlReadout()}
 async function loadState(){controlStatus.textContent='Loading device state...';const res=await fetch('/api/state');if(!res.ok)throw new Error('Failed to load state');const data=await res.json();applyStateToUi(data);controlStatus.textContent='Device state loaded';configStatus.textContent=data.ap_restart_required?'Saved AP config is waiting for a reset.':'Configuration loaded'}
 async function saveControl(){controlStatus.textContent='Applying control...';stashEffectControls();const brightness=Number(controlBrightness.value);const payload={brightness:brightness,color:controlColor.value,effect:selectedEffect,effect_params:getSelectedEffectValues(),power:brightness>0};if((EFFECT_META[selectedEffect].colors||[])[0]){payload.effect_color=getSelectedEffectColor()}const res=await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!res.ok)throw new Error(await res.text()||'Failed to apply control');const data=await res.json();applyStateToUi(data);controlStatus.textContent='Control saved'}
-async function saveConfig(){configStatus.textContent='Saving configuration...';const payload={count:Number(configCount.value),ap_ssid:configApSsid.value.trim(),ap_password:configApPassword.value,auto_update_enabled:configAutoUpdate.checked};const res=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!res.ok)throw new Error(await res.text()||'Failed to save configuration');const data=await res.json();applyStateToUi(data);configStatus.textContent=data.ap_restart_required?'Configuration saved. Press Reset to apply the new AP credentials.':'Configuration saved'}
+async function saveConfig(){configStatus.textContent='Saving configuration...';const payload={count:Number(configCount.value),ap_ssid:configApSsid.value.trim(),ap_password:configApPassword.value};const res=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!res.ok)throw new Error(await res.text()||'Failed to save configuration');const data=await res.json();applyStateToUi(data);configStatus.textContent=data.ap_restart_required?'Configuration saved. Press Reset to apply the new AP credentials.':'Configuration saved'}
 async function uploadOta(){const file=otaFile.files&&otaFile.files[0];if(!file)throw new Error('Choose a firmware .bin file first');setOtaBusy(true);otaStatus.textContent='Uploading '+file.name+' ('+file.size+' bytes)...';const res=await fetch('/api/ota',{method:'POST',headers:{'Content-Type':'application/octet-stream','X-Filename':file.name},body:file});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok)throw new Error(data.message||text||'OTA update failed');otaStatus.textContent=data.message||'Update installed. Device will restart.';actionStatus.textContent='OTA accepted. Reconnect after reboot.';setTimeout(()=>window.location.reload(),12000)}
 async function postAction(url,statusEl,confirmText){if(confirmText&&!window.confirm(confirmText))return;statusEl.textContent='Sending command...';const res=await fetch(url,{method:'POST'});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok)throw new Error(data.message||text||'Action failed');statusEl.textContent=data.message||'Command sent';setTimeout(()=>window.location.reload(),12000)}
-async function checkPublishedUpdate(){actionStatus.textContent='Queueing published update check...';const res=await fetch('/api/check-update',{method:'POST'});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok)throw new Error(data.message||text||'Published update check failed');actionStatus.textContent=data.message||'Published update check queued';setTimeout(()=>loadState().catch(err=>actionStatus.textContent=err.message),2000)}
+async function checkPublishedUpdate(){updateStatusLine.textContent='Checking GitHub for the latest release...';const res=await fetch('/api/check-update',{method:'POST'});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok)throw new Error(data.message||text||'Published update check failed');updateStatusLine.textContent=data.message||'Check queued';setTimeout(()=>loadState().catch(err=>updateStatusLine.textContent=err.message),3000)}
+async function installPublishedUpdate(){if(!window.confirm('Install the latest published firmware now? The device will reboot.'))return;updateStatusLine.textContent='Queueing install...';installUpdateBtn.disabled=true;const res=await fetch('/api/install-update',{method:'POST'});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok){installUpdateBtn.disabled=false;throw new Error(data.message||text||'Install failed')}updateStatusLine.textContent=data.message||'Install queued';setTimeout(()=>loadState().catch(err=>updateStatusLine.textContent=err.message),3000)}
 mainTabButtons.forEach((button)=>button.addEventListener('click',()=>switchMainTab(button.dataset.mainTab)));
 configCount.addEventListener('input',()=>syncConfigCount(configCount.value));
 configCountNumber.addEventListener('input',()=>{const max=Number(configCount.max);let v=Number(configCountNumber.value||1);v=Math.max(1,Math.min(max,v));syncConfigCount(v)});
@@ -443,7 +490,8 @@ saveControlBtn.addEventListener('click',()=>saveControl().catch(err=>controlStat
 saveConfigBtn.addEventListener('click',()=>saveConfig().catch(err=>configStatus.textContent=err.message));
 document.getElementById('reloadBtn').addEventListener('click',()=>loadState().catch(err=>controlStatus.textContent=err.message));
 otaBtn.addEventListener('click',()=>uploadOta().catch(err=>{otaStatus.textContent=err.message;setOtaBusy(false)}));
-checkUpdateBtn.addEventListener('click',()=>checkPublishedUpdate().catch(err=>actionStatus.textContent=err.message));
+checkUpdateBtn.addEventListener('click',()=>checkPublishedUpdate().catch(err=>updateStatusLine.textContent=err.message));
+installUpdateBtn.addEventListener('click',()=>installPublishedUpdate().catch(err=>updateStatusLine.textContent=err.message));
 rebootBtn.addEventListener('click',()=>postAction('/api/reboot',configStatus,'Reset the device now?').catch(err=>configStatus.textContent=err.message));
 revertBtn.addEventListener('click',()=>postAction('/api/revert',actionStatus,'Revert to the previous firmware slot and reboot?').catch(err=>actionStatus.textContent=err.message));
 factoryResetBtn.addEventListener('click',()=>postAction('/api/factory-reset',actionStatus,'Factory reset will erase Matter pairing, Wi-Fi AP config, and saved LED settings. Continue?').catch(err=>actionStatus.textContent=err.message));
@@ -536,9 +584,55 @@ static void copy_string_value(char *dest, size_t dest_size, const char *src)
     dest[copy_len] = '\0';
 }
 
+static const char *wifi_disconnect_reason_to_text(uint16_t reason)
+{
+    switch (reason) {
+    case 0:
+        return "none";
+    case 2:
+        return "auth-expire";
+    case 3:
+        return "auth-leave";
+    case 4:
+        return "assoc-expire";
+    case 5:
+        return "assoc-too-many";
+    case 6:
+        return "not-authenticated";
+    case 7:
+        return "not-associated";
+    case 8:
+        return "assoc-leave";
+    case 15:
+        return "4way-timeout";
+    case 16:
+        return "group-key-timeout";
+    case 23:
+        return "802.1x-auth-failed";
+    case 200:
+        return "beacon-timeout";
+    case 201:
+        return "no-ap-found";
+    case 202:
+        return "auth-failed";
+    case 203:
+        return "assoc-failed";
+    case 204:
+        return "handshake-timeout";
+    case 205:
+        return "connection-failed";
+    default:
+        return "unknown";
+    }
+}
+
 typedef struct {
     char version[APP_AUTO_UPDATE_VERSION_MAX];
     char asset_url[APP_AUTO_UPDATE_URL_MAX];
+    uint8_t sha256[32];                 // expected SHA-256 of the .bin
+    size_t  asset_size;                 // expected byte size of the .bin (0 if unknown)
+    uint8_t cohort_percent;             // rollout percent, 0..100 (default 100 if absent)
+    bool    has_sha256;
 } published_update_info_t;
 
 static void set_auto_update_state(bool busy, bool available, const char *latest_version, const char *asset_url,
@@ -555,30 +649,6 @@ static void set_auto_update_state(bool busy, bool available, const char *latest_
     copy_string_value(s_auto_update_asset_url, sizeof(s_auto_update_asset_url), asset_url);
     copy_string_value(s_auto_update_status, sizeof(s_auto_update_status), status);
     xSemaphoreGive(s_state_mutex);
-}
-
-static void set_auto_update_enabled(bool enabled)
-{
-    if (!s_state_mutex) {
-        s_auto_update_enabled = enabled;
-        return;
-    }
-
-    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    s_auto_update_enabled = enabled;
-    xSemaphoreGive(s_state_mutex);
-}
-
-static bool is_auto_update_enabled()
-{
-    if (!s_state_mutex) {
-        return s_auto_update_enabled;
-    }
-
-    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    bool enabled = s_auto_update_enabled;
-    xSemaphoreGive(s_state_mutex);
-    return enabled;
 }
 
 static bool parse_version_parts(const char *text, int *parts, size_t part_count, size_t *used_count)
@@ -657,13 +727,113 @@ static void normalize_release_version(const char *tag, char *output, size_t outp
     copy_string_value(output, output_len, normalized);
 }
 
-static esp_err_t fetch_https_response(const char *url, char **response_out, size_t max_size)
+// Stable "latest" download URL pattern. GitHub redirects to the actual asset
+// at S3; esp_http_client follows 30x by default.
+static void build_release_url(char *out, size_t out_size, const char *asset_name)
 {
-    if (!url || !response_out || max_size < 2) {
+    std::snprintf(out, out_size, "https://github.com/%s/releases/latest/download/%s",
+                  APP_UPDATE_RELEASE_REPO, asset_name);
+}
+
+static int hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+    if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+    return -1;
+}
+
+static bool hex_decode(const char *hex, uint8_t *out, size_t out_len)
+{
+    if (!hex || !out) return false;
+    if (std::strlen(hex) != out_len * 2) return false;
+    for (size_t i = 0; i < out_len; ++i) {
+        int hi = hex_nibble(hex[i * 2]);
+        int lo = hex_nibble(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return true;
+}
+
+// Device cohort id: stable [0, 99] derived from the Wi-Fi STA MAC. Used to
+// decide whether this device participates in a partial rollout. We do NOT
+// hash with any secret here — the goal is just deterministic bucketing.
+static uint8_t device_cohort_id()
+{
+    uint8_t mac[6] = {};
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK) {
+        return 0;
+    }
+    // FNV-1a 32-bit over the 6-byte MAC.
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < 6; ++i) {
+        h ^= mac[i];
+        h *= 16777619u;
+    }
+    return (uint8_t)(h % 100u);
+}
+
+// Verify an ECDSA-P256-SHA256 signature (DER-encoded) over `msg` using the
+// PEM-encoded public key embedded in release_pubkey.h. Returns ESP_OK on
+// valid signature, ESP_ERR_INVALID_STATE if no key configured.
+static esp_err_t verify_manifest_signature(const uint8_t *msg, size_t msg_len,
+                                            const uint8_t *sig, size_t sig_len)
+{
+#if CONFIG_APP_OTA_SIG_VERIFY
+    if (kReleasePubKeyPemLen == 0) {
+        ESP_LOGW(TAG, "No release public key embedded; signature check skipped.");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!msg || !sig || sig_len == 0) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    *response_out = nullptr;
+    uint8_t hash[32];
+    int rc = mbedtls_sha256(msg, msg_len, hash, 0);
+    if (rc != 0) {
+        return ESP_FAIL;
+    }
+
+    mbedtls_pk_context pk;
+    mbedtls_pk_init(&pk);
+    rc = mbedtls_pk_parse_public_key(&pk,
+                                     reinterpret_cast<const unsigned char *>(kReleasePubKeyPem),
+                                     kReleasePubKeyPemLen + 1);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "mbedtls_pk_parse_public_key failed: -0x%04x", -rc);
+        mbedtls_pk_free(&pk);
+        return ESP_FAIL;
+    }
+
+    rc = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, hash, sizeof(hash), sig, sig_len);
+    mbedtls_pk_free(&pk);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "manifest signature verify failed: -0x%04x", -rc);
+        return ESP_ERR_INVALID_CRC;
+    }
+    return ESP_OK;
+#else
+    (void) msg; (void) msg_len; (void) sig; (void) sig_len;
+    ESP_LOGW(TAG, "CONFIG_APP_OTA_SIG_VERIFY=n — manifest signature check skipped.");
+    return ESP_OK;
+#endif
+}
+
+// IDF's streaming HTTP client (open + fetch_headers + read) doesn't auto-
+// follow redirects, but GitHub's /releases/latest/download/... URLs return
+// 302 to an S3 asset URL. Follow up to 5 redirects manually.
+static constexpr int kMaxHttpRedirects = 5;
+
+static esp_err_t fetch_https_bytes(const char *url, uint8_t **buf_out, size_t *len_out, size_t max_size,
+                                    const char *accept)
+{
+    if (!url || !buf_out || !len_out || max_size < 2) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *buf_out = nullptr;
+    *len_out = 0;
+
     esp_http_client_config_t config = {};
     config.url = url;
     config.timeout_ms = 15000;
@@ -671,72 +841,113 @@ static esp_err_t fetch_https_response(const char *url, char **response_out, size
     config.crt_bundle_attach = esp_crt_bundle_attach;
     config.user_agent = APP_UPDATE_USER_AGENT;
     config.keep_alive_enable = true;
+    // S3 (the GitHub-release redirect target) sends ~2 KB response headers
+    // AND its signed redirect URL is ~1.5 KB by itself — both the RX header
+    // buffer and the TX request-line buffer need to be much larger than
+    // IDF's 512-byte defaults.
+    config.buffer_size = 8192;
+    config.buffer_size_tx = 4096;
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
         return ESP_FAIL;
     }
+    if (accept) {
+        esp_http_client_set_header(client, "Accept", accept);
+    }
 
-    esp_err_t err = esp_http_client_set_header(client, "Accept", "application/vnd.github+json");
-    if (err == ESP_OK) {
-        err = esp_http_client_set_header(client, "X-GitHub-Api-Version", "2022-11-28");
+    // GitHub occasionally resets the TLS connection (MBEDTLS_ERR_NET_CONN_RESET)
+    // on rapid back-to-back requests. Treat open/fetch_headers as retryable.
+    constexpr int kMaxTransientRetries = 2;
+    int redirects = 0;
+    int retries = 0;
+    int status_code = 0;
+    esp_err_t last_err = ESP_OK;
+    while (true) {
+        esp_err_t err = esp_http_client_open(client, 0);
+        if (err != ESP_OK) {
+            last_err = err;
+            if (++retries <= kMaxTransientRetries) {
+                ESP_LOGW(TAG, "HTTP open failed (%s); retry %d/%d after backoff",
+                         esp_err_to_name(err), retries, kMaxTransientRetries);
+                vTaskDelay(pdMS_TO_TICKS(750));
+                continue;
+            }
+            esp_http_client_cleanup(client);
+            return err;
+        }
+        int headers_rc = esp_http_client_fetch_headers(client);
+        if (headers_rc < 0) {
+            last_err = ESP_FAIL;
+            if (++retries <= kMaxTransientRetries) {
+                ESP_LOGW(TAG, "fetch_headers failed; retry %d/%d after backoff",
+                         retries, kMaxTransientRetries);
+                esp_http_client_close(client);
+                vTaskDelay(pdMS_TO_TICKS(750));
+                continue;
+            }
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+            return ESP_FAIL;
+        }
+        status_code = esp_http_client_get_status_code(client);
+        if (status_code == 301 || status_code == 302 || status_code == 303 ||
+            status_code == 307 || status_code == 308) {
+            if (++redirects > kMaxHttpRedirects) {
+                ESP_LOGW(TAG, "Too many redirects fetching %s", url);
+                esp_http_client_close(client);
+                esp_http_client_cleanup(client);
+                return ESP_FAIL;
+            }
+            // set_redirection() reads Location and updates the client URL;
+            // the next open() targets the redirected endpoint.
+            esp_http_client_set_redirection(client);
+            esp_http_client_close(client);
+            continue;
+        }
+        break;
     }
-    if (err == ESP_OK) {
-        err = esp_http_client_open(client, 0);
-    }
-    if (err != ESP_OK) {
+    (void) last_err;
+
+    if (status_code != 200) {
+        ESP_LOGW(TAG, "HTTP %d for %s", status_code, url);
+        esp_http_client_close(client);
         esp_http_client_cleanup(client);
-        return err;
+        return ESP_FAIL;
     }
 
-    int http_status = 0;
-    char *buffer = static_cast<char *>(malloc(max_size + 1));
-    if (!buffer) {
+    uint8_t *buf = static_cast<uint8_t *>(malloc(max_size + 1));
+    if (!buf) {
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
         return ESP_ERR_NO_MEM;
     }
 
-    http_status = esp_http_client_fetch_headers(client);
-    if (http_status < 0) {
-        free(buffer);
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return ESP_FAIL;
-    }
-
     size_t total = 0;
     while (true) {
         if (total >= max_size) {
-            free(buffer);
+            free(buf);
             esp_http_client_close(client);
             esp_http_client_cleanup(client);
             return ESP_ERR_HTTP_FETCH_HEADER;
         }
-
-        int read = esp_http_client_read(client, buffer + total, max_size - total);
+        int read = esp_http_client_read(client, reinterpret_cast<char *>(buf + total), max_size - total);
         if (read < 0) {
-            free(buffer);
+            free(buf);
             esp_http_client_close(client);
             esp_http_client_cleanup(client);
             return ESP_FAIL;
         }
-        if (read == 0) {
-            break;
-        }
+        if (read == 0) break;
         total += static_cast<size_t>(read);
     }
 
-    int status_code = esp_http_client_get_status_code(client);
-    buffer[total] = '\0';
+    buf[total] = '\0';
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
-    if (status_code != 200) {
-        free(buffer);
-        return ESP_FAIL;
-    }
 
-    *response_out = buffer;
+    *buf_out = buf;
+    *len_out = total;
     return ESP_OK;
 }
 
@@ -748,62 +959,395 @@ static esp_err_t fetch_latest_published_update(published_update_info_t *info)
 
     info->version[0] = '\0';
     info->asset_url[0] = '\0';
+    info->asset_size = 0;
+    info->cohort_percent = 100;
+    info->has_sha256 = false;
+    std::memset(info->sha256, 0, sizeof(info->sha256));
 
-    char *response = nullptr;
-    esp_err_t err = fetch_https_response(APP_UPDATE_RELEASE_API_URL, &response, APP_AUTO_UPDATE_JSON_LIMIT);
+    char manifest_url[APP_AUTO_UPDATE_URL_MAX];
+    char sig_url[APP_AUTO_UPDATE_URL_MAX];
+    build_release_url(manifest_url, sizeof(manifest_url), APP_UPDATE_MANIFEST_NAME);
+    build_release_url(sig_url, sizeof(sig_url), APP_UPDATE_MANIFEST_SIG_NAME);
+
+    uint8_t *manifest_bytes = nullptr;
+    size_t   manifest_len = 0;
+    esp_err_t err = fetch_https_bytes(manifest_url, &manifest_bytes, &manifest_len,
+                                       APP_AUTO_UPDATE_JSON_LIMIT, "application/json");
     if (err != ESP_OK) {
         return err;
     }
 
-    cJSON *root = cJSON_Parse(response);
-    free(response);
+#if CONFIG_APP_OTA_SIG_VERIFY
+    if (kReleasePubKeyPemLen > 0) {
+        uint8_t *sig_bytes = nullptr;
+        size_t   sig_len = 0;
+        err = fetch_https_bytes(sig_url, &sig_bytes, &sig_len, APP_AUTO_UPDATE_SIG_LIMIT, "application/octet-stream");
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Could not fetch manifest signature: %s", esp_err_to_name(err));
+            free(manifest_bytes);
+            // Distinct from "asset URL missing" so the UI message is accurate.
+            return ESP_ERR_HTTP_CONNECT;
+        }
+        err = verify_manifest_signature(manifest_bytes, manifest_len, sig_bytes, sig_len);
+        free(sig_bytes);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Manifest signature invalid — refusing");
+            free(manifest_bytes);
+            return ESP_ERR_INVALID_CRC;
+        }
+    }
+#endif
+
+    cJSON *root = cJSON_ParseWithLength(reinterpret_cast<const char *>(manifest_bytes), manifest_len);
+    free(manifest_bytes);
     if (!root) {
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    cJSON *tag_name = cJSON_GetObjectItemCaseSensitive(root, "tag_name");
-    cJSON *assets = cJSON_GetObjectItemCaseSensitive(root, "assets");
-    if (!cJSON_IsString(tag_name) || !cJSON_IsArray(assets)) {
+    cJSON *version = cJSON_GetObjectItemCaseSensitive(root, "version");
+    cJSON *chip = cJSON_GetObjectItemCaseSensitive(root, "chip");
+    cJSON *app_obj = cJSON_GetObjectItemCaseSensitive(root, "app");
+    if (!cJSON_IsString(version) || !cJSON_IsObject(app_obj)) {
         cJSON_Delete(root);
         return ESP_ERR_INVALID_RESPONSE;
     }
+    if (cJSON_IsString(chip) && std::strcmp(chip->valuestring, "esp32c6") != 0) {
+        ESP_LOGW(TAG, "Manifest chip=%s does not match esp32c6", chip->valuestring);
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_VERSION;
+    }
 
-    normalize_release_version(tag_name->valuestring, info->version, sizeof(info->version));
-    cJSON *asset = nullptr;
-    cJSON_ArrayForEach(asset, assets) {
-        cJSON *name = cJSON_GetObjectItemCaseSensitive(asset, "name");
-        cJSON *browser_download_url = cJSON_GetObjectItemCaseSensitive(asset, "browser_download_url");
-        if (cJSON_IsString(name) && cJSON_IsString(browser_download_url) &&
-            std::strcmp(name->valuestring, APP_UPDATE_ASSET_NAME) == 0) {
-            copy_string_value(info->asset_url, sizeof(info->asset_url), browser_download_url->valuestring);
-            break;
+    normalize_release_version(version->valuestring, info->version, sizeof(info->version));
+
+    cJSON *url = cJSON_GetObjectItemCaseSensitive(app_obj, "url");
+    cJSON *sha = cJSON_GetObjectItemCaseSensitive(app_obj, "sha256");
+    cJSON *size = cJSON_GetObjectItemCaseSensitive(app_obj, "size");
+    if (cJSON_IsString(url)) {
+        copy_string_value(info->asset_url, sizeof(info->asset_url), url->valuestring);
+    } else {
+        // Fall back to the canonical /releases/latest/download/ URL — same effect.
+        build_release_url(info->asset_url, sizeof(info->asset_url), APP_UPDATE_ASSET_NAME);
+    }
+    if (cJSON_IsString(sha) && std::strlen(sha->valuestring) == APP_UPDATE_SHA256_HEX_LEN) {
+        info->has_sha256 = hex_decode(sha->valuestring, info->sha256, sizeof(info->sha256));
+    }
+    if (cJSON_IsNumber(size) && size->valuedouble > 0) {
+        info->asset_size = (size_t) size->valuedouble;
+    }
+
+    cJSON *rollout = cJSON_GetObjectItemCaseSensitive(root, "rollout");
+    if (cJSON_IsObject(rollout)) {
+        cJSON *pct = cJSON_GetObjectItemCaseSensitive(rollout, "percent");
+        if (cJSON_IsNumber(pct)) {
+            double p = pct->valuedouble;
+            if (p < 0) p = 0;
+            if (p > 100) p = 100;
+            info->cohort_percent = (uint8_t) p;
         }
     }
-    cJSON_Delete(root);
 
+    cJSON_Delete(root);
     return info->asset_url[0] != '\0' ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
-static esp_err_t install_https_ota_from_url(const char *url)
+// Probation marker — persisted across reboots so we can implement an
+// N-strike rollback policy. Lives in its own NVS namespace so factory reset
+// of led_cfg doesn't disturb it.
+//
+//   slot    : "ota_0" / "ota_1" — partition label of the image on probation
+//   ver     : manifest.version of that image (debug)
+//   strikes : boot attempts so far. > APP_OTA_MAX_STRIKES → rollback.
+#define APP_OTA_HEALTH_NS          "ota_health"
+#define APP_OTA_HEALTH_KEY_SLOT    "slot"
+#define APP_OTA_HEALTH_KEY_VER     "ver"
+#define APP_OTA_HEALTH_KEY_STRIKES "strikes"
+#define APP_OTA_MAX_STRIKES        2
+
+static esp_err_t ota_health_clear()
 {
-    if (!url || url[0] == '\0') {
+    nvs_handle_t h = 0;
+    esp_err_t err = nvs_open(APP_OTA_HEALTH_NS, NVS_READWRITE, &h);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+    nvs_erase_all(h);
+    nvs_commit(h);
+    nvs_close(h);
+    return ESP_OK;
+}
+
+static esp_err_t ota_health_read(char *slot, size_t slot_len, char *ver, size_t ver_len, uint8_t *strikes)
+{
+    nvs_handle_t h = 0;
+    esp_err_t err = nvs_open(APP_OTA_HEALTH_NS, NVS_READONLY, &h);
+    if (err != ESP_OK) {
+        return err;  // ESP_ERR_NVS_NOT_FOUND if no marker yet
+    }
+    size_t s_len = slot_len;
+    size_t v_len = ver_len;
+    if (slot && slot_len) slot[0] = '\0';
+    if (ver && ver_len)  ver[0] = '\0';
+    if (strikes) *strikes = 0;
+
+    err = nvs_get_str(h, APP_OTA_HEALTH_KEY_SLOT, slot, &s_len);
+    if (err != ESP_OK) { nvs_close(h); return err; }
+    err = nvs_get_str(h, APP_OTA_HEALTH_KEY_VER, ver, &v_len);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) { nvs_close(h); return err; }
+    if (strikes) {
+        uint8_t v = 0;
+        err = nvs_get_u8(h, APP_OTA_HEALTH_KEY_STRIKES, &v);
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            v = 0;
+            err = ESP_OK;
+        }
+        *strikes = v;
+    }
+    nvs_close(h);
+    return ESP_OK;
+}
+
+static esp_err_t ota_health_write(const char *slot, const char *ver, uint8_t strikes)
+{
+    nvs_handle_t h = 0;
+    esp_err_t err = nvs_open(APP_OTA_HEALTH_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    nvs_set_str(h, APP_OTA_HEALTH_KEY_SLOT, slot ? slot : "");
+    nvs_set_str(h, APP_OTA_HEALTH_KEY_VER, ver ? ver : "");
+    nvs_set_u8(h, APP_OTA_HEALTH_KEY_STRIKES, strikes);
+    err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
+// Called very early in app_main, right after NVS init. Manages the
+// probationary boot lifecycle: if the running image is under probation,
+// either roll back (too many failed attempts), or increment the strike
+// counter and mark the image valid so the bootloader's built-in 1-strike
+// rollback doesn't fire ahead of us.
+static void init_ota_probation()
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (!running) {
+        return;
+    }
+
+    char marker_slot[16] = "";
+    char marker_ver[APP_AUTO_UPDATE_VERSION_MAX] = "";
+    uint8_t strikes = 0;
+    esp_err_t err = ota_health_read(marker_slot, sizeof(marker_slot),
+                                    marker_ver, sizeof(marker_ver), &strikes);
+    if (err == ESP_ERR_NVS_NOT_FOUND || marker_slot[0] == '\0') {
+        // No probation in progress — nothing to do. If the bootloader marked
+        // us PENDING_VERIFY anyway (e.g., first OTA from a previous firmware
+        // that didn't write a marker), fall back to default ROLLBACK_ENABLE
+        // behavior: the legacy self-test will mark us valid later.
+        return;
+    }
+
+    if (std::strcmp(marker_slot, running->label) != 0) {
+        // Marker references a different slot than what's running. Either the
+        // image was swapped by USB flash / manual revert, or the marker is
+        // stale from a previous run. Clear it.
+        ESP_LOGI(TAG, "OTA probation marker is stale (slot=%s, running=%s) — clearing",
+                 marker_slot, running->label);
+        ota_health_clear();
+        return;
+    }
+
+    uint8_t next_strikes = strikes + 1;
+    ESP_LOGI(TAG, "OTA probation: slot=%s ver=%s attempt=%u (max=%u)",
+             marker_slot, marker_ver, next_strikes, APP_OTA_MAX_STRIKES);
+
+    if (next_strikes > APP_OTA_MAX_STRIKES) {
+        ESP_LOGE(TAG, "OTA probation: too many failed attempts — rolling back");
+        const esp_partition_t *other = esp_ota_get_next_update_partition(nullptr);
+        if (other) {
+            esp_err_t set_err = esp_ota_set_boot_partition(other);
+            ESP_LOGW(TAG, "esp_ota_set_boot_partition(%s): %s",
+                     other->label, esp_err_to_name(set_err));
+        }
+        ota_health_clear();
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_restart();
+    }
+
+    // Persist the bumped strike count BEFORE marking valid. Order matters: a
+    // crash between the increment and mark_valid still gives us a higher
+    // strike count on the next boot.
+    ota_health_write(marker_slot, marker_ver, next_strikes);
+
+    // Neuter the bootloader's 1-strike rollback so we can manage attempts
+    // ourselves. self_test_task will clear the marker on success.
+    esp_err_t mv = esp_ota_mark_app_valid_cancel_rollback();
+    if (mv != ESP_OK && mv != ESP_ERR_NOT_SUPPORTED) {
+        // Not in PENDING_VERIFY (image was already valid) — fine, ignore.
+        ESP_LOGD(TAG, "mark_app_valid: %s", esp_err_to_name(mv));
+    }
+}
+
+// Stream-download the firmware image into the inactive OTA partition while
+// computing SHA-256 along the way. Returns ESP_OK only if the computed digest
+// matches `expected_sha256` (when provided) and the image passes IDF validation.
+static esp_err_t install_https_ota_with_verify(const published_update_info_t *info)
+{
+    if (!info || info->asset_url[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
 
     esp_http_client_config_t http_config = {};
-    http_config.url = url;
-    http_config.timeout_ms = 20000;
+    http_config.url = info->asset_url;
+    http_config.timeout_ms = 30000;
     http_config.transport_type = HTTP_TRANSPORT_OVER_SSL;
     http_config.crt_bundle_attach = esp_crt_bundle_attach;
     http_config.user_agent = APP_UPDATE_USER_AGENT;
+    // S3 (redirect target for GitHub release assets) sends ~2 KB response
+    // headers and its signed redirect URL is ~1.5 KB; both buffers need to
+    // be much larger than IDF's 512-byte defaults.
+    http_config.buffer_size = 8192;
+    http_config.buffer_size_tx = 4096;
     http_config.keep_alive_enable = true;
 
     esp_https_ota_config_t ota_config = {};
     ota_config.http_config = &http_config;
-    return esp_https_ota(&ota_config);
+
+    esp_https_ota_handle_t handle = nullptr;
+    esp_err_t err = esp_https_ota_begin(&ota_config, &handle);
+    if (err != ESP_OK || handle == nullptr) {
+        ESP_LOGE(TAG, "esp_https_ota_begin failed: %s", esp_err_to_name(err));
+        return err == ESP_OK ? ESP_FAIL : err;
+    }
+
+    while (true) {
+        err = esp_https_ota_perform(handle);
+        if (err != ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
+            break;
+        }
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_https_ota_perform failed: %s", esp_err_to_name(err));
+        esp_https_ota_abort(handle);
+        return err;
+    }
+
+    if (!esp_https_ota_is_complete_data_received(handle)) {
+        ESP_LOGE(TAG, "OTA stream ended before all data received");
+        esp_https_ota_abort(handle);
+        return ESP_FAIL;
+    }
+
+    int image_len = esp_https_ota_get_image_size(handle);
+    err = esp_https_ota_finish(handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_https_ota_finish failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    if (image_len <= 0) {
+        ESP_LOGE(TAG, "Downloaded image has zero size");
+        return ESP_FAIL;
+    }
+    if (info->asset_size != 0 && (size_t) image_len != info->asset_size) {
+        ESP_LOGE(TAG, "Image size %d does not match manifest %u", image_len, (unsigned) info->asset_size);
+        // Roll back boot partition to the running one before bailing.
+        const esp_partition_t *running = esp_ota_get_running_partition();
+        if (running) {
+            esp_ota_set_boot_partition(running);
+        }
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    if (info->has_sha256) {
+        // Read the freshly written partition back and SHA-256 it.
+        const esp_partition_t *next = esp_ota_get_next_update_partition(nullptr);
+        if (!next) {
+            ESP_LOGE(TAG, "Could not locate the just-written OTA partition");
+            return ESP_FAIL;
+        }
+
+        mbedtls_sha256_context sha_ctx;
+        mbedtls_sha256_init(&sha_ctx);
+        if (mbedtls_sha256_starts(&sha_ctx, 0) != 0) {
+            mbedtls_sha256_free(&sha_ctx);
+            return ESP_FAIL;
+        }
+
+        uint8_t *buf = static_cast<uint8_t *>(malloc(APP_UPDATE_OTA_BUF_SIZE));
+        if (!buf) {
+            mbedtls_sha256_free(&sha_ctx);
+            return ESP_ERR_NO_MEM;
+        }
+        size_t remaining = (size_t) image_len;
+        size_t offset = 0;
+        while (remaining > 0) {
+            size_t chunk = remaining < APP_UPDATE_OTA_BUF_SIZE ? remaining : APP_UPDATE_OTA_BUF_SIZE;
+            esp_err_t rerr = esp_partition_read(next, offset, buf, chunk);
+            if (rerr != ESP_OK) {
+                free(buf);
+                mbedtls_sha256_free(&sha_ctx);
+                return rerr;
+            }
+            if (mbedtls_sha256_update(&sha_ctx, buf, chunk) != 0) {
+                free(buf);
+                mbedtls_sha256_free(&sha_ctx);
+                return ESP_FAIL;
+            }
+            offset += chunk;
+            remaining -= chunk;
+        }
+        free(buf);
+
+        uint8_t actual[32];
+        if (mbedtls_sha256_finish(&sha_ctx, actual) != 0) {
+            mbedtls_sha256_free(&sha_ctx);
+            return ESP_FAIL;
+        }
+        mbedtls_sha256_free(&sha_ctx);
+
+        if (std::memcmp(actual, info->sha256, sizeof(actual)) != 0) {
+            ESP_LOGE(TAG, "OTA SHA-256 mismatch — reverting boot partition");
+            const esp_partition_t *running = esp_ota_get_running_partition();
+            if (running) {
+                esp_ota_set_boot_partition(running);
+            }
+            return ESP_ERR_INVALID_CRC;
+        }
+        ESP_LOGI(TAG, "OTA SHA-256 verified (%d bytes)", image_len);
+    } else {
+        ESP_LOGW(TAG, "Manifest has no sha256 — installed without integrity check");
+    }
+
+    // Write the probation marker so the next boot enters the 2-strike state
+    // machine. esp_https_ota_finish has already pointed the boot target at
+    // the new slot, so esp_ota_get_next_update_partition(NULL) returns that
+    // slot (the one we just wrote).
+    const esp_partition_t *target = esp_ota_get_next_update_partition(nullptr);
+    if (target) {
+        esp_err_t herr = ota_health_write(target->label, info->version, 0);
+        if (herr != ESP_OK) {
+            ESP_LOGW(TAG, "ota_health_write failed: %s (rollback safety degraded)",
+                     esp_err_to_name(herr));
+        }
+    }
+
+    return ESP_OK;
 }
 
-static void run_published_update_check(bool install_if_new)
+// Modes for the published-update worker. `kInstallForced` is reserved for the
+// user's explicit Install Now button — it bypasses cohort gating because user
+// action is a stronger signal than a rollout percent.
+enum class published_update_mode_t {
+    kCheckOnly,       // periodic check: refresh available version & status, never install
+    kInstallForced,   // user clicked Install Now: install if newer, regardless of cohort
+};
+
+static volatile published_update_mode_t s_pending_update_mode = published_update_mode_t::kCheckOnly;
+
+static void run_published_update_check(published_update_mode_t mode)
 {
     const esp_app_desc_t *app_desc = esp_app_get_description();
     const char *current_version = app_desc ? app_desc->version : "unknown";
@@ -827,6 +1371,11 @@ static void run_published_update_check(bool install_if_new)
                                   "The latest GitHub release does not include esp32c6_led_web.bin.");
         } else if (err == ESP_ERR_INVALID_RESPONSE) {
             set_auto_update_state(false, false, "", "", "The latest GitHub release metadata was invalid.");
+        } else if (err == ESP_ERR_INVALID_CRC) {
+            set_auto_update_state(false, false, "", "", "The latest release manifest signature did not verify.");
+        } else if (err == ESP_ERR_HTTP_CONNECT) {
+            set_auto_update_state(false, false, "", "",
+                                  "Could not download the manifest signature — try again in a moment.");
         } else {
             set_auto_update_state(false, false, "", "", "Failed to fetch the latest published firmware.");
         }
@@ -843,20 +1392,30 @@ static void run_published_update_check(bool install_if_new)
         return;
     }
 
-    if (!install_if_new) {
+    if (mode == published_update_mode_t::kCheckOnly) {
         char status[APP_AUTO_UPDATE_STATUS_MAX];
-        std::snprintf(status, sizeof(status), "Published update %s is available.", release.version);
+        uint8_t cohort = device_cohort_id();
+        if (cohort < release.cohort_percent) {
+            std::snprintf(status, sizeof(status),
+                          "Update %s available — press Install Update to apply.", release.version);
+        } else {
+            std::snprintf(status, sizeof(status),
+                          "Update %s available (rollout %u%%; you can still install manually).",
+                          release.version, release.cohort_percent);
+        }
         set_auto_update_state(false, true, release.version, release.asset_url, status);
         xSemaphoreGive(s_ota_mutex);
         return;
     }
 
+    // mode == kInstallForced: user pressed Install Now. Skip cohort gating.
     char status[APP_AUTO_UPDATE_STATUS_MAX];
     std::snprintf(status, sizeof(status), "Installing published update %s...", release.version);
     set_auto_update_state(true, true, release.version, release.asset_url, status);
-    err = install_https_ota_from_url(release.asset_url);
+    err = install_https_ota_with_verify(&release);
     if (err != ESP_OK) {
-        std::snprintf(status, sizeof(status), "Published update %s failed to install.", release.version);
+        std::snprintf(status, sizeof(status), "Published update %s failed to install (%s).",
+                      release.version, esp_err_to_name(err));
         set_auto_update_state(false, true, release.version, release.asset_url, status);
         xSemaphoreGive(s_ota_mutex);
         return;
@@ -872,14 +1431,86 @@ static void run_published_update_check(bool install_if_new)
 static void auto_update_task(void *arg)
 {
     (void) arg;
-    while (true) {
-        uint32_t notify_count = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(APP_AUTO_UPDATE_INTERVAL_MS));
-        bool install_if_new = is_auto_update_enabled();
-        if (!install_if_new && notify_count == 0) {
-            continue;
-        }
-        run_published_update_check(install_if_new);
+
+    // Initial jitter: random [0, APP_UPDATE_INITIAL_JITTER_MIN] minutes so the
+    // periodic check doesn't run at boot+0 for every device on a fresh release.
+    // A manual "check now"/"install now" notify wakes us early.
+    uint32_t jitter_ms = 0;
+    if (APP_AUTO_UPDATE_JITTER_MS > 0) {
+        jitter_ms = (uint32_t)(esp_random() % APP_AUTO_UPDATE_JITTER_MS);
+        ESP_LOGI(TAG, "Auto-update: initial jitter %u ms", (unsigned) jitter_ms);
     }
+    if (jitter_ms > 0) {
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(jitter_ms));
+    }
+
+    while (true) {
+        // Snapshot the pending mode (user request or default periodic check),
+        // then reset to kCheckOnly so the next scheduled wake-up doesn't
+        // accidentally repeat a forced install.
+        published_update_mode_t mode = s_pending_update_mode;
+        s_pending_update_mode = published_update_mode_t::kCheckOnly;
+        run_published_update_check(mode);
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(APP_AUTO_UPDATE_INTERVAL_MS));
+    }
+}
+
+static bool matter_is_ready();  // defined below; used by self_test_task
+
+// Self-test: a freshly OTA-installed image is considered healthy when (a) we
+// have an STA IP (or AP credentials at minimum) and (b) the Matter stack is
+// running. On success we clear the probation marker — the image is permanent.
+// On timeout we just reboot. The next boot's init_ota_probation() will
+// increment the strike count and roll back after APP_OTA_MAX_STRIKES failures.
+//
+// Manages probation strictly via the NVS marker (written by
+// install_https_ota_with_verify), not the partition state, because
+// init_ota_probation() already called mark_app_valid_cancel_rollback() and
+// neutralized the bootloader's PENDING_VERIFY tracking.
+static void self_test_task(void *arg)
+{
+    (void) arg;
+
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (!running) {
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    char marker_slot[16] = "";
+    char marker_ver[APP_AUTO_UPDATE_VERSION_MAX] = "";
+    uint8_t strikes = 0;
+    esp_err_t err = ota_health_read(marker_slot, sizeof(marker_slot),
+                                    marker_ver, sizeof(marker_ver), &strikes);
+    if (err != ESP_OK || marker_slot[0] == '\0' ||
+        std::strcmp(marker_slot, running->label) != 0) {
+        // No active probation — nothing to verify.
+        ESP_LOGI(TAG, "self-test: no probation marker for %s; skipping", running->label);
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    ESP_LOGI(TAG, "self-test: probation active (ver=%s strikes=%u), waiting up to %llu ms for STA + Matter",
+             marker_ver, strikes, APP_UPDATE_SELF_TEST_TIMEOUT_MS);
+
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(APP_UPDATE_SELF_TEST_TIMEOUT_MS);
+    while (xTaskGetTickCount() < deadline) {
+        bool sta_ok = s_sta_ip[0] != '\0';
+        bool matter_ok = matter_is_ready();
+        if (sta_ok && matter_ok) {
+            ota_health_clear();
+            ESP_LOGI(TAG, "self-test: OK — STA up, Matter ready. Image promoted.");
+            vTaskDelete(nullptr);
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    ESP_LOGE(TAG, "self-test: deadline reached without STA+Matter — rebooting "
+                  "(strike %u of %u allowed)", strikes, APP_OTA_MAX_STRIKES);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    esp_restart();
+    vTaskDelete(nullptr);
 }
 
 static void set_generated_ap_credentials()
@@ -1339,7 +1970,6 @@ static esp_err_t save_state_to_nvs(const led_state_t *state)
     esp_err_t ret = ESP_OK;
     nvs_handle_t nvs_handle = 0;
     char key[16];
-    uint8_t auto_update_enabled = s_auto_update_enabled ? 1 : 0;
     ESP_RETURN_ON_ERROR(nvs_open(APP_NVS_NAMESPACE, NVS_READWRITE, &nvs_handle), TAG, "nvs_open failed");
     ESP_GOTO_ON_ERROR(nvs_set_u16(nvs_handle, "count", state->count), cleanup, TAG, "save count failed");
     ESP_GOTO_ON_ERROR(nvs_set_u8(nvs_handle, "red", state->red), cleanup, TAG, "save red failed");
@@ -1348,7 +1978,6 @@ static esp_err_t save_state_to_nvs(const led_state_t *state)
     ESP_GOTO_ON_ERROR(nvs_set_u8(nvs_handle, "bright", state->brightness), cleanup, TAG, "save brightness failed");
     ESP_GOTO_ON_ERROR(nvs_set_u8(nvs_handle, "power", state->power ? 1 : 0), cleanup, TAG, "save power failed");
     ESP_GOTO_ON_ERROR(nvs_set_u8(nvs_handle, "effect", state->effect), cleanup, TAG, "save effect failed");
-    ESP_GOTO_ON_ERROR(nvs_set_u8(nvs_handle, "auto_upd", auto_update_enabled), cleanup, TAG, "save auto update failed");
     ESP_GOTO_ON_ERROR(nvs_set_str(nvs_handle, "ap_ssid", s_ap_ssid), cleanup, TAG, "save ap ssid failed");
     ESP_GOTO_ON_ERROR(nvs_set_str(nvs_handle, "ap_pass", s_ap_password), cleanup, TAG, "save ap password failed");
     for (uint8_t effect = 0; effect < LED_EFFECT_COUNT; ++effect) {
@@ -1391,7 +2020,6 @@ static bool load_state_from_nvs()
     uint8_t brightness = s_led_state.brightness;
     uint8_t power = s_led_state.power ? 1 : 0;
     uint8_t effect = s_led_state.effect;
-    uint8_t auto_update_enabled = s_auto_update_enabled ? 1 : 0;
     size_t ssid_len = sizeof(s_ap_ssid);
     size_t pass_len = sizeof(s_ap_password);
 
@@ -1402,7 +2030,6 @@ static bool load_state_from_nvs()
     nvs_get_u8(nvs_handle, "bright", &brightness);
     nvs_get_u8(nvs_handle, "power", &power);
     nvs_get_u8(nvs_handle, "effect", &effect);
-    nvs_get_u8(nvs_handle, "auto_upd", &auto_update_enabled);
     nvs_get_str(nvs_handle, "ap_ssid", s_ap_ssid, &ssid_len);
     nvs_get_str(nvs_handle, "ap_pass", s_ap_password, &pass_len);
     for (uint8_t loaded_effect = 0; loaded_effect < LED_EFFECT_COUNT; ++loaded_effect) {
@@ -1426,7 +2053,6 @@ static bool load_state_from_nvs()
     s_led_state.brightness = brightness;
     s_led_state.power = power != 0;
     s_led_state.effect = effect;
-    set_auto_update_enabled(auto_update_enabled != 0);
     clamp_state(&s_led_state);
     refresh_matter_hs_trackers_from_rgb(s_led_state.red, s_led_state.green, s_led_state.blue);
     return true;
@@ -1652,14 +2278,12 @@ static esp_err_t sync_matter_state_from_led_state()
 static esp_err_t send_state_json(httpd_req_t *req)
 {
     led_state_t snapshot;
-    bool auto_update_enabled = false;
     bool auto_update_busy = false;
     bool auto_update_available = false;
     char auto_update_status[APP_AUTO_UPDATE_STATUS_MAX] = "";
     char auto_update_latest_version[APP_AUTO_UPDATE_VERSION_MAX] = "";
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     snapshot = s_led_state;
-    auto_update_enabled = s_auto_update_enabled;
     auto_update_busy = s_auto_update_busy;
     auto_update_available = s_auto_update_available;
     copy_string_value(auto_update_status, sizeof(auto_update_status), s_auto_update_status);
@@ -1720,17 +2344,30 @@ static esp_err_t send_state_json(httpd_req_t *req)
     cJSON_AddBoolToObject(root, "matter_ready", matter_is_ready());
     cJSON_AddBoolToObject(root, "commissioned", matter_is_commissioned());
     cJSON_AddNumberToObject(root, "matter_endpoint", s_light_endpoint_id);
+    cJSON_AddNumberToObject(root, "matter_fabric_count", static_cast<double>(chip::Server::GetInstance().GetFabricTable().FabricCount()));
+    cJSON_AddBoolToObject(root, "matter_window_open", s_matter_window_open);
     cJSON_AddStringToObject(root, "fw_version", app_desc ? app_desc->version : "unknown");
     cJSON_AddStringToObject(root, "running_partition", running_partition ? running_partition->label : "");
     cJSON_AddStringToObject(root, "ota_target_partition", ota_target_partition ? ota_target_partition->label : "");
     cJSON_AddBoolToObject(root, "revert_available", revert_partition != nullptr);
     cJSON_AddStringToObject(root, "revert_partition", revert_partition ? revert_partition->label : "");
     cJSON_AddStringToObject(root, "revert_version", revert_partition ? revert_desc.version : "");
-    cJSON_AddBoolToObject(root, "auto_update_enabled", auto_update_enabled);
     cJSON_AddBoolToObject(root, "auto_update_busy", auto_update_busy);
     cJSON_AddBoolToObject(root, "auto_update_available", auto_update_available);
     cJSON_AddStringToObject(root, "auto_update_status", auto_update_status);
     cJSON_AddStringToObject(root, "auto_update_latest_version", auto_update_latest_version);
+    cJSON_AddStringToObject(root, "sta_ssid", s_sta_ssid);
+    cJSON_AddStringToObject(root, "sta_bssid", s_sta_bssid);
+    cJSON_AddNumberToObject(root, "sta_rssi", s_sta_rssi);
+    cJSON_AddNumberToObject(root, "sta_channel", s_sta_channel);
+    cJSON_AddNumberToObject(root, "sta_last_disconnect_reason", s_sta_last_disconnect_reason);
+    cJSON_AddStringToObject(root, "sta_last_disconnect_reason_text", wifi_disconnect_reason_to_text(s_sta_last_disconnect_reason));
+    cJSON_AddNumberToObject(root, "sta_connect_count", static_cast<double>(s_sta_connect_count));
+    cJSON_AddNumberToObject(root, "sta_disconnect_count", static_cast<double>(s_sta_disconnect_count));
+    cJSON_AddNumberToObject(root, "sta_last_event_ms", static_cast<double>(s_sta_last_event_ms));
+    cJSON_AddNumberToObject(root, "sta_last_ip_ms", static_cast<double>(s_sta_last_ip_ms));
+    cJSON_AddNumberToObject(root, "matter_commissioned_count", static_cast<double>(s_matter_commissioned_count));
+    cJSON_AddNumberToObject(root, "matter_last_event_ms", static_cast<double>(s_matter_last_event_ms));
     cJSON_AddStringToObject(root, "manual_code", s_matter_manual_code);
     cJSON_AddStringToObject(root, "qr_code", s_matter_qr_code);
     cJSON_AddStringToObject(root, "qr_url", s_matter_qr_url);
@@ -1914,9 +2551,7 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     cJSON *count = cJSON_GetObjectItemCaseSensitive(root, "count");
     cJSON *ap_ssid = cJSON_GetObjectItemCaseSensitive(root, "ap_ssid");
     cJSON *ap_password = cJSON_GetObjectItemCaseSensitive(root, "ap_password");
-    cJSON *auto_update_enabled = cJSON_GetObjectItemCaseSensitive(root, "auto_update_enabled");
-    if (!cJSON_IsNumber(count) || !cJSON_IsString(ap_ssid) || !cJSON_IsString(ap_password) ||
-        !(cJSON_IsBool(auto_update_enabled) || auto_update_enabled == nullptr)) {
+    if (!cJSON_IsNumber(count) || !cJSON_IsString(ap_ssid) || !cJSON_IsString(ap_password)) {
         cJSON_Delete(root);
         httpd_resp_set_status(req, "400 Bad Request");
         return httpd_resp_sendstr(req, "Missing configuration fields");
@@ -1934,9 +2569,6 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     clamp_state(&s_led_state);
     copy_string_value(s_ap_ssid, sizeof(s_ap_ssid), ap_ssid->valuestring);
     copy_string_value(s_ap_password, sizeof(s_ap_password), ap_password->valuestring);
-    if (auto_update_enabled) {
-        s_auto_update_enabled = cJSON_IsTrue(auto_update_enabled);
-    }
     err = apply_led_state_locked(&s_led_state);
     if (err == ESP_OK) {
         err = save_state_to_nvs(&s_led_state);
@@ -1947,15 +2579,6 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     if (err != ESP_OK) {
         httpd_resp_set_status(req, "500 Internal Server Error");
         return httpd_resp_sendstr(req, "Failed to save configuration");
-    }
-
-    if (is_auto_update_enabled()) {
-        set_auto_update_state(false, false, "", "", "Published update check queued after enabling auto-update.");
-        if (s_auto_update_task) {
-            xTaskNotifyGive(s_auto_update_task);
-        }
-    } else {
-        set_auto_update_state(false, false, "", "", "Auto-update is disabled.");
     }
 
     return send_state_json(req);
@@ -2147,10 +2770,31 @@ static esp_err_t check_update_post_handler(httpd_req_t *req)
         return send_message_json(req, "Published update task is not ready.");
     }
 
+    s_pending_update_mode = published_update_mode_t::kCheckOnly;
     set_auto_update_state(false, false, "", "", "Published update check queued.");
     xTaskNotifyGive(s_auto_update_task);
     httpd_resp_set_status(req, "200 OK");
     return send_message_json(req, "Published update check queued.");
+}
+
+static esp_err_t install_update_post_handler(httpd_req_t *req)
+{
+    if (!s_auto_update_task) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return send_message_json(req, "Published update task is not ready.");
+    }
+    if (!s_auto_update_available || s_auto_update_latest_version[0] == '\0') {
+        httpd_resp_set_status(req, "409 Conflict");
+        return send_message_json(req,
+            "No published update is currently available. Run Check For Updates first.");
+    }
+
+    s_pending_update_mode = published_update_mode_t::kInstallForced;
+    set_auto_update_state(true, true, s_auto_update_latest_version, s_auto_update_asset_url,
+                          "Install requested. Downloading and verifying...");
+    xTaskNotifyGive(s_auto_update_task);
+    httpd_resp_set_status(req, "200 OK");
+    return send_message_json(req, "Install queued. The device will reboot after success.");
 }
 
 static esp_err_t reboot_post_handler(httpd_req_t *req)
@@ -2260,6 +2904,11 @@ static void start_webserver()
     check_update_post.method = HTTP_POST;
     check_update_post.handler = check_update_post_handler;
 
+    httpd_uri_t install_update_post = {};
+    install_update_post.uri = "/api/install-update";
+    install_update_post.method = HTTP_POST;
+    install_update_post.handler = install_update_post_handler;
+
     httpd_uri_t reboot_post = {};
     reboot_post.uri = "/api/reboot";
     reboot_post.method = HTTP_POST;
@@ -2312,6 +2961,7 @@ static void start_webserver()
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &config_post));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &ota_post));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &check_update_post));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &install_update_post));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &reboot_post));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &revert_post));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &factory_reset_post));
@@ -2466,9 +3116,28 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         break;
     }
     case WIFI_EVENT_STA_CONNECTED:
+        s_sta_connect_count++;
+        s_sta_last_event_ms = esp_log_timestamp();
+        s_sta_last_disconnect_reason = 0;
+        {
+            wifi_ap_record_t ap_info = {};
+            if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+                copy_string_value(s_sta_ssid, sizeof(s_sta_ssid), reinterpret_cast<const char *>(ap_info.ssid));
+                std::snprintf(s_sta_bssid, sizeof(s_sta_bssid), MACSTR, MAC2STR(ap_info.bssid));
+                s_sta_rssi = ap_info.rssi;
+                s_sta_channel = ap_info.primary;
+            }
+        }
         ESP_LOGI(TAG, "Matter station connected to upstream Wi-Fi");
         break;
     case WIFI_EVENT_STA_DISCONNECTED:
+        s_sta_disconnect_count++;
+        s_sta_last_event_ms = esp_log_timestamp();
+        if (event_data) {
+            auto *event = static_cast<wifi_event_sta_disconnected_t *>(event_data);
+            s_sta_last_disconnect_reason = event->reason;
+            ESP_LOGW(TAG, "Matter station disconnected, reason=%u", static_cast<unsigned int>(event->reason));
+        }
         s_sta_ip[0] = '\0';
         set_auto_update_state(false, false, s_auto_update_latest_version, s_auto_update_asset_url,
                               "Waiting for LAN Wi-Fi before checking published updates.");
@@ -2489,9 +3158,12 @@ static void ip_event_handler(void *arg, esp_event_base_t event_base, int32_t eve
     if (event_id == IP_EVENT_STA_GOT_IP) {
         auto *event = static_cast<ip_event_got_ip_t *>(event_data);
         std::snprintf(s_sta_ip, sizeof(s_sta_ip), IPSTR, IP2STR(&event->ip_info.ip));
+        s_sta_last_ip_ms = esp_log_timestamp();
         ESP_LOGI(TAG, "Matter station IP: %s", s_sta_ip);
         ESP_LOGI(TAG, "LAN web UI available at http://%s", s_sta_ip);
         if (s_auto_update_task) {
+            // Refresh available-version info — never auto-install.
+            s_pending_update_mode = published_update_mode_t::kCheckOnly;
             xTaskNotifyGive(s_auto_update_task);
         }
     }
@@ -2718,8 +3390,10 @@ static void configure_matter_node()
 static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
 {
     (void) arg;
+    s_matter_last_event_ms = esp_log_timestamp();
     switch (event->Type) {
     case chip::DeviceLayer::DeviceEventType::kCommissioningComplete:
+        s_matter_commissioned_count++;
         ESP_LOGI(TAG, "Matter commissioning complete");
         refresh_ip_strings();
         break;
@@ -2733,12 +3407,14 @@ static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
         break;
 
     case chip::DeviceLayer::DeviceEventType::kCommissioningWindowOpened:
+        s_matter_window_open = true;
         ESP_LOGI(TAG, "Matter commissioning window opened");
         refresh_matter_onboarding_data();
         PrintOnboardingCodes(chip::RendezvousInformationFlags(chip::RendezvousInformationFlag::kBLE));
         break;
 
     case chip::DeviceLayer::DeviceEventType::kCommissioningWindowClosed:
+        s_matter_window_open = false;
         ESP_LOGI(TAG, "Matter commissioning window closed");
         break;
 
@@ -2777,6 +3453,10 @@ extern "C" void app_main()
     }
     ESP_ERROR_CHECK(ret);
 
+    // Probationary-boot check — must run before any task that might crash and
+    // take us back through the bootloader without incrementing the strike count.
+    init_ota_probation();
+
     s_state_mutex = xSemaphoreCreateMutex();
     assert(s_state_mutex != nullptr);
     s_ota_mutex = xSemaphoreCreateMutex();
@@ -2805,9 +3485,9 @@ extern "C" void app_main()
     start_softap_overlay();
     start_webserver();
     set_auto_update_state(false, false, "", "",
-                          is_auto_update_enabled() ? "Waiting for LAN Wi-Fi before checking published updates."
-                                                   : "Auto-update is disabled.");
+                          "Waiting for LAN Wi-Fi before checking published updates.");
     xTaskCreate(auto_update_task, "auto_update", 8192, nullptr, 4, &s_auto_update_task);
+    xTaskCreate(self_test_task, "self_test", 4096, nullptr, 5, nullptr);
     xTaskCreate(effect_task, "effect_task", 4096, nullptr, 4, nullptr);
     xTaskCreate(captive_dns_task, "captive_dns", 4096, nullptr, 4, nullptr);
 

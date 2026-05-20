@@ -1,0 +1,78 @@
+menu "ESP32-C6 LED Web — Hardware"
+
+config APP_LED_GPIO
+    int "GPIO connected to WS2812B DIN"
+    range 0 30
+    default 17
+    help
+        Data-in pin for the LED strip. XIAO ESP32C6 board mapping:
+        D0=GPIO0, D1=GPIO1, D2=GPIO2, D3=GPIO21, D4=GPIO22, D5=GPIO23,
+        D6=GPIO16, D7=GPIO17, D8=GPIO19, D9=GPIO20, D10=GPIO18.
+        Avoid GPIO 10/11 (SPI flash) and GPIO 12/13 (USB JTAG) on bare
+        ESP32-C6 modules.
+
+config APP_LED_MAX_PIXELS
+    int "Maximum number of pixels the firmware will drive"
+    range 1 1024
+    default 256
+    help
+        Compile-time upper bound on strip length. Runtime LED count is
+        configurable in the captive portal up to this limit. RAM cost is
+        roughly 4 bytes per pixel for the RMT-driver encode buffer plus
+        the small fixed overhead, so 256 is ~1 KB.
+
+endmenu
+
+menu "ESP32-C6 LED Web — OTA / Release settings"
+
+config APP_RELEASE_REPO
+    string "GitHub repository to poll for releases (owner/name)"
+    default "alperbasarn/esp32c6-led-web"
+    help
+        Used to build the manifest and asset URLs the device hits.
+        Override in CI by writing to sdkconfig.defaults before build, or set in menuconfig.
+
+config APP_RELEASE_ASSET_NAME
+    string "Firmware asset filename in the GitHub release"
+    default "esp32c6_led_web.bin"
+    help
+        Must match the filename the publish-firmware workflow uploads.
+
+config APP_RELEASE_MANIFEST_NAME
+    string "Manifest filename in the GitHub release"
+    default "manifest.json"
+
+config APP_RELEASE_MANIFEST_SIG_NAME
+    string "Detached signature filename in the GitHub release"
+    default "manifest.json.sig"
+
+config APP_UPDATE_INTERVAL_HOURS
+    int "Hours between auto-update polls"
+    range 1 168
+    default 6
+
+config APP_UPDATE_INITIAL_JITTER_MIN
+    int "First-poll random delay after Wi-Fi up (minutes)"
+    range 0 120
+    default 30
+    help
+        Avoids the herd effect right after publishing a release: every device picks a
+        random delay in [0, this many minutes] before its first manifest fetch.
+
+config APP_UPDATE_SELF_TEST_TIMEOUT_S
+    int "First-boot self-test deadline before rollback (seconds)"
+    range 30 600
+    default 90
+    help
+        After an OTA reboot the app must come up and complete the self-test inside
+        this window, otherwise IDF rolls back to the previous slot.
+
+config APP_OTA_SIG_VERIFY
+    bool "Verify manifest signature with embedded ECDSA P-256 public key"
+    default y
+    help
+        Signature verification uses the public key embedded at build time in
+        main/include/release_pubkey.h. Disabling skips verification — only safe
+        for local dev builds.
+
+endmenu
