@@ -6,8 +6,8 @@ It exposes the strip in two ways:
 
 - A local web page for LED count, color, brightness, effects, OTA, and reset actions
 - A Matter extended color light endpoint for Apple Home
-- A local OTA firmware upload flow from the same web page
-- Automatic update checks against the latest published GitHub release
+- Local OTA firmware upload from the same web page (manual `.bin` install)
+- Periodic background checks against the latest published GitHub release; user-triggered install with a signed-manifest verification chain
 - A firmware revert action that boots back into the other OTA slot
 - A factory reset action that clears Matter pairing, Wi-Fi AP config, and saved LED settings
 - Built-in LED effects: `glow`, `rainbow`, `chase`, `sparkle`, `wave`
@@ -19,8 +19,9 @@ The firmware starts a Wi-Fi SoftAP, serves the control page directly from the bo
 
 - SoftAP SSID/password: generated per device on first boot and stored in NVS
 - Web UI: `http://192.168.4.1`
-- LED data GPIO: `17` (`D7` on XIAO ESP32C6)
-- Maximum strip length compiled in: `120`
+- LED data GPIO: `17` (`D7` on XIAO ESP32C6) — configurable via Kconfig
+- Maximum strip length compiled in: `256` — configurable via Kconfig
+- Auto-update check interval: 6 h, with `[0, 30 min]` first-poll jitter — configurable via Kconfig
 - Matter device type: extended color light
 
 ## Wiring
@@ -34,24 +35,38 @@ For anything beyond a few LEDs, use an external 5V supply.
 
 ## Build and flash
 
+You need ESP-IDF `v5.4.1` and esp-matter at the commit pinned in [`.github/workflows/publish-firmware.yml`](.github/workflows/publish-firmware.yml) (`ESP_MATTER_REF`). For full setup instructions see the [Espressif ESP-IDF guide](https://docs.espressif.com/projects/esp-idf/en/v5.4.1/esp32c6/get-started/index.html) and the [esp-matter README](https://github.com/espressif/esp-matter).
+
+Once your environment is set up:
+
 ```bash
+. ~/esp/esp-idf-5.4.1/export.sh
+export ESP_MATTER_PATH=~/esp/esp-matter-pinned
 cd ~/esp32c6-led-web
-idf.py build
-idf.py -p /dev/ttyACM0 flash monitor
+idf.py set-target esp32c6 build
+idf.py -p /dev/ttyACM0 flash monitor          # Linux/macOS
+idf.py -p COM6 flash monitor                  # Windows
 ```
 
-The first install still needs USB flashing. After that, you can upload new firmware from the web UI using the generated app binary:
+**The first install needs a USB flash.** After that, the device can pull new firmware over the air — either by uploading a `.bin` you built locally (Configuration → Install From File) or, more usually, by waiting for the next published GitHub release and pressing Install Update.
+
+For first-time USB flash, the CI workflow publishes `bootloader.bin`, `partition-table.bin`, `ota_data_initial.bin` (you'll generate this locally), and `esp32c6_led_web.bin` to every GitHub release. You can flash all four with esptool directly without a local toolchain:
 
 ```bash
-~/esp32c6-led-web/build/esp32c6_led_web.bin
+python -m esptool --chip esp32c6 -p COM6 -b 460800 --before default-reset --after hard-reset \
+    write-flash --flash-mode dio --flash-size 4MB --flash-freq 80m \
+    0x0 bootloader.bin \
+    0xc000 partition-table.bin \
+    0x1d000 ota_data_initial.bin \
+    0x20000 esp32c6_led_web.bin
 ```
 
 ## Web UI layout
 
 The device page is split into three tabs:
 
-- `Overview`: Matter state, AP and LAN web UI URLs, firmware version, running slot, revert target
-- `Configuration`: LED count, SoftAP SSID/password, auto-update toggle, OTA upload, published update check, revert button, factory reset, reboot
+- `Overview`: Matter state, AP and LAN web UI URLs, current firmware version, running slot, revert target, latest available release, update status
+- `Configuration`: LED count, SoftAP SSID/password, the Firmware Update card (Current vs. Available version, **Install Update** button, Check For Updates button, and a manual **Install From File** path), revert button, factory reset, reboot
 - `Control`: brightness, color, and one sub-tab per effect with its own parameters
 
 The SoftAP credentials shown in `Configuration` are the credentials hosted by the ESP32-C6 itself for the local setup page. On a fresh device they are generated automatically and printed to the serial log when the AP starts.
@@ -69,15 +84,15 @@ The local web page also shows the current Matter state, manual setup code, QR UR
 
 ## OTA updates
 
-1. Build a new firmware image with `idf.py build`.
-2. Open the device web UI at `http://192.168.4.1` or its LAN IP after commissioning.
-3. In the `Firmware Update` section, choose `build/esp32c6_led_web.bin`.
-4. Click `Install OTA Update`.
-5. Wait for the board to reboot into the other OTA slot.
+There are two OTA paths in the firmware:
 
-After at least one successful OTA update, the `Revert To Previous Firmware` button in `Configuration` can boot the device back into the other application slot.
+**Install From File (dev escape hatch).** Build a `.bin` locally with `idf.py build`, open the device web UI, in the `Firmware Update` card choose your file, click `Install From File`. The device writes the bytes to the inactive OTA slot and reboots into it. No signature verification on this path — it bypasses the manifest-trust chain by design so you can recover a stuck device or test pre-release builds. **Do not use this path to ship firmware to anyone but yourself.**
 
-This OTA path updates the application partition only. Bootloader and partition table changes still require USB flashing.
+**Install Update (published-release flow).** The device periodically (every `CONFIG_APP_UPDATE_INTERVAL_HOURS`, default 6 h) fetches `manifest.json` from the latest GitHub release and verifies its ECDSA P-256 signature. If a newer version is available, the Firmware Update card shows the version and enables an `Install Update` button. Pressing the button downloads the binary, SHA-256-verifies it against the manifest, switches the boot partition, reboots, and runs a 2-strike self-test before promoting the image to permanent. See the next section.
+
+After at least one successful update, the `Revert To Previous Firmware` button in `Configuration` can boot the device back into the other application slot without erasing settings.
+
+Both paths update the application partition only. Bootloader and partition table changes still require USB flashing.
 
 ## Published auto-updates
 
@@ -91,19 +106,37 @@ Each release publishes a signed `manifest.json` to the GitHub release. The devic
 4. Compares `manifest.version` against the running firmware. Skips if not newer.
 5. Cohort-gates: a stable hash of the device MAC % 100 must be less than `manifest.rollout.percent`. Devices outside the cohort surface an "available, waiting" status without installing.
 6. Downloads the binary via `esp_https_ota`, then reads the freshly written OTA partition back and compares its SHA-256 against `manifest.app.sha256`. On mismatch the boot partition is reverted before reboot.
-7. After reboot, a self-test task waits for Wi-Fi STA + the HTTP server to come up within `CONFIG_APP_UPDATE_SELF_TEST_TIMEOUT_S` and calls `esp_ota_mark_app_valid_cancel_rollback()`. If the deadline passes, the device rolls back automatically.
+7. After reboot, an early-boot probation step writes a strike counter to NVS (`ota_health` namespace) and neutralizes the bootloader's built-in 1-strike rollback by calling `esp_ota_mark_app_valid_cancel_rollback()`. We're now in charge of probation.
+8. A `self_test_task` waits up to `CONFIG_APP_UPDATE_SELF_TEST_TIMEOUT_S` (default 90 s) for **both Wi-Fi STA up AND Matter ready**. On success it clears the NVS marker — the image is permanent. On timeout it `esp_restart()`s; the next boot increments the strike count.
+9. After `APP_OTA_MAX_STRIKES` (= 2) consecutive failed attempts, the early-boot probation step rolls back: `esp_ota_set_boot_partition(previous_slot)` + clear marker + restart.
 
-Each device's first poll is jittered randomly in `[0, CONFIG_APP_UPDATE_INITIAL_JITTER_MIN]` minutes after Wi-Fi up. The manual "Check Published Update Now" button bypasses the jitter.
+So a broken release has three layers of defense:
+
+| Failure                                               | Caught by                |
+|-------------------------------------------------------|--------------------------|
+| Bytes don't match `manifest.app.sha256`                | SHA-256 check, no reboot |
+| Boots, but Wi-Fi/Matter never come up                  | self-test timeout (×2)   |
+| Panics or hangs the watchdog before self-test runs    | next boot's strike count |
+
+Each device's first poll is jittered randomly in `[0, CONFIG_APP_UPDATE_INITIAL_JITTER_MIN]` minutes after Wi-Fi up. The `Check For Updates` button bypasses the jitter. The check is automatic and periodic; install is always manual.
 
 ### Publishing a release
 
-1. Tag and publish a release on GitHub (`gh release create v1.5.0 --generate-notes`).
-2. The `Publish Firmware` workflow builds the app, then runs [`scripts/generate-manifest.sh`](scripts/generate-manifest.sh) which produces `manifest.json` + `manifest.json.sig` and uploads:
+**Rule:** any `.bin` that signs a manifest and ships to devices in the field must come from CI, never a local build. Local builds are for development and your own USB-flashed test board.
+
+To cut a release:
+
+1. Bump `PROJECT_VER` in [`CMakeLists.txt`](CMakeLists.txt). The new value is what the device's `esp_app_get_description()->version` will report.
+2. Commit and push to `main`. The push triggers the `Publish Firmware` workflow which builds + warms the CI cache (no release artifacts attached on push).
+3. `gh release create vX.Y --generate-notes --title "X.Y"`. This fires the workflow on the `release: published` event.
+4. The workflow builds the app (`idf.py set-target esp32c6 build`), then runs [`scripts/generate-manifest.sh`](scripts/generate-manifest.sh) which produces `manifest.json` + `manifest.json.sig` and uploads:
    - `esp32c6_led_web.bin` — the OTA application image
    - `bootloader.bin`, `partition-table.bin` — needed for first-time USB flashes
    - `manifest.json`, `manifest.json.sig` — what devices read
 
-The workflow is pinned to the `esp-matter` revision in `ESP_MATTER_REF`. If you upgrade the Matter stack, bump that env in [`.github/workflows/publish-firmware.yml`](.github/workflows/publish-firmware.yml) so CI matches local builds.
+Pinned versions live in workflow env (`IDF_VERSION`, `ESP_MATTER_REF`). If you upgrade the Matter stack or IDF, bump them in [`.github/workflows/publish-firmware.yml`](.github/workflows/publish-firmware.yml) so CI matches what you build locally.
+
+ESP-IDF is cached in CI under the `main` branch scope (no per-tag re-clone). esp-matter is shallow-cloned each run because a full recursive clone exceeds GitHub's 10 GB per-repo cache budget; shallow clone takes ~10 min per release. Total release CI runtime: ~20 min.
 
 ### Signing key management
 
