@@ -56,27 +56,24 @@ jobs:
           cd "$HOME/esp-idf"
           ./install.sh esp32c6
 
-      # Cache esp-matter (clone + submodules + the chip .environment built by
-      # install.sh, trimmed of build-time scratch). Keyed on ESP_MATTER_REF so
-      # any pin bump invalidates. Bump suffix to invalidate manually.
-      - name: Restore esp-matter cache
-        id: cache-matter
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/esp-matter
-          key: matter-${{ env.ESP_MATTER_REF }}-${{ runner.os }}-v2
-
-      - name: Check out esp-matter (cache miss)
-        if: steps.cache-matter.outputs.cache-hit != 'true'
+      # esp-matter is too big to cache on GitHub's free per-repo budget — a
+      # full recursive clone lands around 28-38 GB (mostly third_party + git
+      # history), well over the 10 GB cache limit. Shallow-clone everything
+      # instead; that's the part that was actually slow about a full install
+      # anyway. Total install drops from ~20 min to ~4-5 min for the clone
+      # plus the usual install.sh runtime.
+      - name: Check out esp-matter (shallow)
         shell: bash
         run: |
-          git clone --recursive https://github.com/espressif/esp-matter.git "$HOME/esp-matter"
-          git -C "$HOME/esp-matter" checkout "$ESP_MATTER_REF"
-          git -C "$HOME/esp-matter" submodule update --init --recursive
+          mkdir -p "$HOME/esp-matter"
+          cd "$HOME/esp-matter"
+          git init --quiet
+          git remote add origin https://github.com/espressif/esp-matter.git
+          git fetch --depth=1 origin "$ESP_MATTER_REF"
+          git checkout FETCH_HEAD
+          git submodule update --init --recursive --depth=1
 
-      - name: Install esp-matter dependencies (cache miss)
-        if: steps.cache-matter.outputs.cache-hit != 'true'
+      - name: Install esp-matter dependencies
         shell: bash
         run: |
           export IDF_PATH="$HOME/esp-idf"
@@ -100,25 +97,6 @@ jobs:
 
           cd "$HOME/esp-matter"
           ./install.sh --no-host-tool
-
-      # Trim throwaway scratch dirs that bloat the post-save cache. We don't
-      # need .environment/gn_out (pigweed's setup-time GN output — regenerable
-      # at no extra cost during the project build), .environment/logs (install
-      # logs), or *.pyc / __pycache__ noise. Combined this typically drops the
-      # matter cache from ~6 GB compressed to ~3 GB, keeping it under the
-      # 10 GB-per-repo total alongside the IDF cache.
-      - name: Prune esp-matter cache
-        if: steps.cache-matter.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          chip="$HOME/esp-matter/connectedhomeip/connectedhomeip"
-          before=$(du -sm "$HOME/esp-matter" 2>/dev/null | cut -f1)
-          rm -rf "$chip/.environment/gn_out" 2>/dev/null || true
-          rm -rf "$chip/.environment/logs" 2>/dev/null || true
-          find "$chip" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
-          find "$chip" -name '*.pyc' -delete 2>/dev/null || true
-          after=$(du -sm "$HOME/esp-matter" 2>/dev/null | cut -f1)
-          echo "esp-matter size: ${before} MB -> ${after} MB"
 
       - name: Export build environment
         shell: bash
