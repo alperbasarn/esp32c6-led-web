@@ -188,6 +188,10 @@ static uint32_t s_matter_commissioned_count = 0;
 static bool s_matter_window_open = false;
 static uint32_t s_matter_last_event_ms = 0;
 static bool s_auto_update_busy = false;
+// When true (the default), the periodic published-update check auto-installs
+// any newer release the device is in cohort for. Toggleable via captive
+// portal Configuration tab. Persisted in NVS under led_cfg/auto_inst.
+static bool s_auto_install_enabled = true;
 static bool s_auto_update_available = false;
 static char s_auto_update_status[APP_AUTO_UPDATE_STATUS_MAX] = "Published update checks are idle.";
 static char s_auto_update_latest_version[APP_AUTO_UPDATE_VERSION_MAX] = "";
@@ -292,13 +296,14 @@ input[type=file]{width:100%;padding:12px 14px;background:#091223;border:1px dash
 <div class="label"><span>AP Password</span><span class="value">8-63 chars</span></div>
 <input id="configApPassword" type="password" maxlength="63" value="">
 </div>
+<label class="toggle"><span>Install published updates automatically</span><input id="configAutoInstall" type="checkbox" checked></label>
 </div>
 <div class="actions">
 <button class="btn btn-primary" id="saveConfigBtn">Save Configuration</button>
 <button class="btn btn-secondary" id="rebootBtn">Reset</button>
 </div>
 <div class="status" id="configStatus"></div>
-<div class="footer">New AP credentials are saved immediately but become active after a reset.</div>
+<div class="footer">New AP credentials are saved immediately but become active after a reset. With auto-install on, the device installs newer published releases on its own; off, it only checks and surfaces them for you to press Install Update.</div>
 </div>
 <div class="card">
 <h2>Firmware Actions</h2>
@@ -396,6 +401,7 @@ const configCountNumber = document.getElementById('configCountNumber');
 const configCountValue = document.getElementById('configCountValue');
 const configApSsid = document.getElementById('configApSsid');
 const configApPassword = document.getElementById('configApPassword');
+const configAutoInstall = document.getElementById('configAutoInstall');
 const controlBrightness = document.getElementById('controlBrightness');
 const controlColor = document.getElementById('controlColor');
 const controlColorValue = document.getElementById('controlColorValue');
@@ -471,10 +477,10 @@ function setLink(linkEl,url,emptyLabel){if(url){linkEl.href=url;linkEl.textConte
 function refreshOverview(data){overviewMatterStatus.textContent=data.commissioned?'Commissioned':'Ready to pair';overviewMatterEndpoint.textContent=data.matter_endpoint;overviewMatterFabricCount.textContent=(data.matter_fabric_count??'-');overviewMatterWindow.textContent=data.matter_window_open?'Open':'Closed';overviewManualCode.textContent=data.manual_code||'Unavailable';setLink(overviewQrLink,data.qr_url,'Unavailable');overviewApSsid.textContent=data.ap_ssid||'-';setLink(overviewApUrl,data.ap_url||(data.ap_ip?('http://'+data.ap_ip):''),'Unavailable');overviewStaStatus.textContent=data.sta_connected?'Connected':'Not connected';overviewStaSsid.textContent=data.sta_ssid||'-';overviewStaBssid.textContent=(data.sta_bssid||'-')+(data.sta_channel?(' / ch '+data.sta_channel):'');overviewStaRssi.textContent=(data.sta_rssi||data.sta_rssi===0)?(data.sta_rssi+' dBm'):'-';overviewStaReason.textContent=(data.sta_last_disconnect_reason&&data.sta_last_disconnect_reason!==0)?((data.sta_last_disconnect_reason_text||'unknown')+' ('+String(data.sta_last_disconnect_reason)+')'):'None';setLink(overviewLanUrl,data.lan_url||(data.sta_ip?('http://'+data.sta_ip):''),'Not connected');overviewApRestart.textContent=data.ap_restart_required?'Yes, reset to apply new AP config':'No';overviewFwVersion.textContent=data.fw_version||'unknown';overviewRunningPartition.textContent=data.running_partition||'-';overviewNextPartition.textContent=data.ota_target_partition||'-';overviewRevertTarget.textContent=data.revert_available?((data.revert_version||'unknown')+' @ '+(data.revert_partition||'')):'No previous firmware available';overviewPublishedVersion.textContent=data.auto_update_latest_version||'Unknown';overviewUpdateStatus.textContent=data.auto_update_status||'Idle'}
 function refreshFirmwarePanel(data){const cur=data.fw_version||'unknown';const avail=data.auto_update_latest_version||'';firmwareCurrentVersion.textContent=cur;firmwareAvailableVersion.textContent=avail?avail:'No update available';const canInstall=!!data.auto_update_available && !data.auto_update_busy && avail && avail!==cur;installUpdateBtn.disabled=!canInstall;installUpdateBtn.textContent=data.auto_update_busy?'Installing...':(canInstall?('Install Update '+avail):'Install Update');updateStatusLine.textContent=data.auto_update_status||'Idle'}
 function setOtaBusy(busy){otaBtn.disabled=busy;otaFile.disabled=busy;otaBtn.textContent=busy?'Uploading OTA...':'Install OTA Update'}
-function applyStateToUi(data){effectProfiles=normalizeEffectProfiles(data.effect_profiles);effectColors=normalizeEffectColors(data.effect_colors);selectedEffect=data.effect||'solid';syncConfigCount(data.count);configCount.max=data.max_leds;configCountNumber.max=data.max_leds;configApSsid.value=data.config_ap_ssid||data.ap_ssid||'';configApPassword.value=data.config_ap_password||'';controlBrightness.value=data.brightness;controlColor.value=data.color;revertBtn.disabled=!data.revert_available;refreshOverview(data);refreshFirmwarePanel(data);otaStatus.textContent='Next OTA slot: '+(data.ota_target_partition||'unknown')+'. Upload build/esp32c6_led_web.bin after the first USB flash.';syncEffectControls();updateControlReadout()}
+function applyStateToUi(data){effectProfiles=normalizeEffectProfiles(data.effect_profiles);effectColors=normalizeEffectColors(data.effect_colors);selectedEffect=data.effect||'solid';syncConfigCount(data.count);configCount.max=data.max_leds;configCountNumber.max=data.max_leds;configApSsid.value=data.config_ap_ssid||data.ap_ssid||'';configApPassword.value=data.config_ap_password||'';if(typeof data.auto_install_enabled==='boolean'){configAutoInstall.checked=data.auto_install_enabled}controlBrightness.value=data.brightness;controlColor.value=data.color;revertBtn.disabled=!data.revert_available;refreshOverview(data);refreshFirmwarePanel(data);otaStatus.textContent='Next OTA slot: '+(data.ota_target_partition||'unknown')+'. Upload build/esp32c6_led_web.bin after the first USB flash.';syncEffectControls();updateControlReadout()}
 async function loadState(){controlStatus.textContent='Loading device state...';const res=await fetch('/api/state');if(!res.ok)throw new Error('Failed to load state');const data=await res.json();applyStateToUi(data);controlStatus.textContent='Device state loaded';configStatus.textContent=data.ap_restart_required?'Saved AP config is waiting for a reset.':'Configuration loaded'}
 async function saveControl(){controlStatus.textContent='Applying control...';stashEffectControls();const brightness=Number(controlBrightness.value);const payload={brightness:brightness,color:controlColor.value,effect:selectedEffect,effect_params:getSelectedEffectValues(),power:brightness>0};if((EFFECT_META[selectedEffect].colors||[])[0]){payload.effect_color=getSelectedEffectColor()}const res=await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!res.ok)throw new Error(await res.text()||'Failed to apply control');const data=await res.json();applyStateToUi(data);controlStatus.textContent='Control saved'}
-async function saveConfig(){configStatus.textContent='Saving configuration...';const payload={count:Number(configCount.value),ap_ssid:configApSsid.value.trim(),ap_password:configApPassword.value};const res=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!res.ok)throw new Error(await res.text()||'Failed to save configuration');const data=await res.json();applyStateToUi(data);configStatus.textContent=data.ap_restart_required?'Configuration saved. Press Reset to apply the new AP credentials.':'Configuration saved'}
+async function saveConfig(){configStatus.textContent='Saving configuration...';const payload={count:Number(configCount.value),ap_ssid:configApSsid.value.trim(),ap_password:configApPassword.value,auto_install_enabled:!!configAutoInstall.checked};const res=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!res.ok)throw new Error(await res.text()||'Failed to save configuration');const data=await res.json();applyStateToUi(data);configStatus.textContent=data.ap_restart_required?'Configuration saved. Press Reset to apply the new AP credentials.':'Configuration saved'}
 async function uploadOta(){const file=otaFile.files&&otaFile.files[0];if(!file)throw new Error('Choose a firmware .bin file first');setOtaBusy(true);otaStatus.textContent='Uploading '+file.name+' ('+file.size+' bytes)...';const res=await fetch('/api/ota',{method:'POST',headers:{'Content-Type':'application/octet-stream','X-Filename':file.name},body:file});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok)throw new Error(data.message||text||'OTA update failed');otaStatus.textContent=data.message||'Update installed. Device will restart.';actionStatus.textContent='OTA accepted. Reconnect after reboot.';setTimeout(()=>window.location.reload(),12000)}
 async function postAction(url,statusEl,confirmText){if(confirmText&&!window.confirm(confirmText))return;statusEl.textContent='Sending command...';const res=await fetch(url,{method:'POST'});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok)throw new Error(data.message||text||'Action failed');statusEl.textContent=data.message||'Command sent';setTimeout(()=>window.location.reload(),12000)}
 async function checkPublishedUpdate(){updateStatusLine.textContent='Checking GitHub for the latest release...';const res=await fetch('/api/check-update',{method:'POST'});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok)throw new Error(data.message||text||'Published update check failed');updateStatusLine.textContent=data.message||'Check queued';setTimeout(()=>loadState().catch(err=>updateStatusLine.textContent=err.message),3000)}
@@ -648,6 +654,28 @@ static void set_auto_update_state(bool busy, bool available, const char *latest_
     copy_string_value(s_auto_update_latest_version, sizeof(s_auto_update_latest_version), latest_version);
     copy_string_value(s_auto_update_asset_url, sizeof(s_auto_update_asset_url), asset_url);
     copy_string_value(s_auto_update_status, sizeof(s_auto_update_status), status);
+    xSemaphoreGive(s_state_mutex);
+}
+
+static bool is_auto_install_enabled()
+{
+    if (!s_state_mutex) {
+        return s_auto_install_enabled;
+    }
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    bool v = s_auto_install_enabled;
+    xSemaphoreGive(s_state_mutex);
+    return v;
+}
+
+static void set_auto_install_enabled(bool enabled)
+{
+    if (!s_state_mutex) {
+        s_auto_install_enabled = enabled;
+        return;
+    }
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_auto_install_enabled = enabled;
     xSemaphoreGive(s_state_mutex);
 }
 
@@ -1393,22 +1421,31 @@ static void run_published_update_check(published_update_mode_t mode)
     }
 
     if (mode == published_update_mode_t::kCheckOnly) {
+        const uint8_t cohort = device_cohort_id();
+        const bool in_cohort = cohort < release.cohort_percent;
+        const bool auto_install = is_auto_install_enabled();
         char status[APP_AUTO_UPDATE_STATUS_MAX];
-        uint8_t cohort = device_cohort_id();
-        if (cohort < release.cohort_percent) {
-            std::snprintf(status, sizeof(status),
-                          "Update %s available — press Install Update to apply.", release.version);
+
+        if (auto_install && in_cohort) {
+            // fall through to install — the install block sets its own status
         } else {
-            std::snprintf(status, sizeof(status),
-                          "Update %s available (rollout %u%%; you can still install manually).",
-                          release.version, release.cohort_percent);
+            if (!auto_install) {
+                std::snprintf(status, sizeof(status),
+                              "Update %s available — auto-install is off, press Install Update.",
+                              release.version);
+            } else if (!in_cohort) {
+                std::snprintf(status, sizeof(status),
+                              "Update %s available (rollout %u%%; you can still install manually).",
+                              release.version, release.cohort_percent);
+            }
+            set_auto_update_state(false, true, release.version, release.asset_url, status);
+            xSemaphoreGive(s_ota_mutex);
+            return;
         }
-        set_auto_update_state(false, true, release.version, release.asset_url, status);
-        xSemaphoreGive(s_ota_mutex);
-        return;
     }
 
-    // mode == kInstallForced: user pressed Install Now. Skip cohort gating.
+    // mode == kInstallForced (or kCheckOnly fall-through with auto-install on
+    // and in-cohort): install regardless of cohort gating.
     char status[APP_AUTO_UPDATE_STATUS_MAX];
     std::snprintf(status, sizeof(status), "Installing published update %s...", release.version);
     set_auto_update_state(true, true, release.version, release.asset_url, status);
@@ -1978,6 +2015,8 @@ static esp_err_t save_state_to_nvs(const led_state_t *state)
     ESP_GOTO_ON_ERROR(nvs_set_u8(nvs_handle, "bright", state->brightness), cleanup, TAG, "save brightness failed");
     ESP_GOTO_ON_ERROR(nvs_set_u8(nvs_handle, "power", state->power ? 1 : 0), cleanup, TAG, "save power failed");
     ESP_GOTO_ON_ERROR(nvs_set_u8(nvs_handle, "effect", state->effect), cleanup, TAG, "save effect failed");
+    ESP_GOTO_ON_ERROR(nvs_set_u8(nvs_handle, "auto_inst", s_auto_install_enabled ? 1 : 0), cleanup, TAG,
+                      "save auto_install_enabled failed");
     ESP_GOTO_ON_ERROR(nvs_set_str(nvs_handle, "ap_ssid", s_ap_ssid), cleanup, TAG, "save ap ssid failed");
     ESP_GOTO_ON_ERROR(nvs_set_str(nvs_handle, "ap_pass", s_ap_password), cleanup, TAG, "save ap password failed");
     for (uint8_t effect = 0; effect < LED_EFFECT_COUNT; ++effect) {
@@ -2030,6 +2069,8 @@ static bool load_state_from_nvs()
     nvs_get_u8(nvs_handle, "bright", &brightness);
     nvs_get_u8(nvs_handle, "power", &power);
     nvs_get_u8(nvs_handle, "effect", &effect);
+    uint8_t auto_install = 1;  // default ON when key missing
+    nvs_get_u8(nvs_handle, "auto_inst", &auto_install);
     nvs_get_str(nvs_handle, "ap_ssid", s_ap_ssid, &ssid_len);
     nvs_get_str(nvs_handle, "ap_pass", s_ap_password, &pass_len);
     for (uint8_t loaded_effect = 0; loaded_effect < LED_EFFECT_COUNT; ++loaded_effect) {
@@ -2053,6 +2094,7 @@ static bool load_state_from_nvs()
     s_led_state.brightness = brightness;
     s_led_state.power = power != 0;
     s_led_state.effect = effect;
+    set_auto_install_enabled(auto_install != 0);
     clamp_state(&s_led_state);
     refresh_matter_hs_trackers_from_rgb(s_led_state.red, s_led_state.green, s_led_state.blue);
     return true;
@@ -2356,6 +2398,7 @@ static esp_err_t send_state_json(httpd_req_t *req)
     cJSON_AddBoolToObject(root, "auto_update_available", auto_update_available);
     cJSON_AddStringToObject(root, "auto_update_status", auto_update_status);
     cJSON_AddStringToObject(root, "auto_update_latest_version", auto_update_latest_version);
+    cJSON_AddBoolToObject(root, "auto_install_enabled", is_auto_install_enabled());
     cJSON_AddStringToObject(root, "sta_ssid", s_sta_ssid);
     cJSON_AddStringToObject(root, "sta_bssid", s_sta_bssid);
     cJSON_AddNumberToObject(root, "sta_rssi", s_sta_rssi);
@@ -2551,6 +2594,7 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     cJSON *count = cJSON_GetObjectItemCaseSensitive(root, "count");
     cJSON *ap_ssid = cJSON_GetObjectItemCaseSensitive(root, "ap_ssid");
     cJSON *ap_password = cJSON_GetObjectItemCaseSensitive(root, "ap_password");
+    cJSON *auto_install = cJSON_GetObjectItemCaseSensitive(root, "auto_install_enabled");
     if (!cJSON_IsNumber(count) || !cJSON_IsString(ap_ssid) || !cJSON_IsString(ap_password)) {
         cJSON_Delete(root);
         httpd_resp_set_status(req, "400 Bad Request");
@@ -2569,6 +2613,9 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     clamp_state(&s_led_state);
     copy_string_value(s_ap_ssid, sizeof(s_ap_ssid), ap_ssid->valuestring);
     copy_string_value(s_ap_password, sizeof(s_ap_password), ap_password->valuestring);
+    if (cJSON_IsBool(auto_install)) {
+        s_auto_install_enabled = cJSON_IsTrue(auto_install);
+    }
     err = apply_led_state_locked(&s_led_state);
     if (err == ESP_OK) {
         err = save_state_to_nvs(&s_led_state);
