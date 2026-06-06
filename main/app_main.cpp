@@ -145,6 +145,7 @@ static const effect_spec_t kEffectSpecs[LED_EFFECT_COUNT] = {
 };
 
 static led_strip_handle_t s_led_strip = nullptr;
+static uint8_t s_led_gpio = APP_LED_GPIO;
 static SemaphoreHandle_t s_state_mutex = nullptr;
 static SemaphoreHandle_t s_ota_mutex = nullptr;
 static httpd_handle_t s_http_server = nullptr;
@@ -211,7 +212,7 @@ static constexpr char INDEX_HTML[] = R"HTML(
 .wrap{max-width:1100px;margin:0 auto;padding:24px}.hero{padding:24px 0 16px}.hero h1{margin:0;font-size:clamp(2rem,5vw,3.6rem);letter-spacing:.04em;text-transform:uppercase}.hero p{margin:12px 0 0;color:var(--muted);max-width:62rem;line-height:1.6}
 .grid{display:grid;gap:18px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}.card{background:var(--card);backdrop-filter:blur(12px);border:1px solid var(--line);border-radius:22px;padding:20px;box-shadow:0 20px 50px rgba(0,0,0,.24)}
 .label{display:flex;justify-content:space-between;align-items:center;color:var(--muted);font-size:.95rem;margin-bottom:10px}.value{color:var(--text);font-weight:700}.swatch{height:128px;border-radius:18px;border:1px solid rgba(255,255,255,.15);background:#ff6020;box-shadow:inset 0 0 50px rgba(255,255,255,.18),0 0 24px rgba(255,120,80,.35);transition:all .18s ease}
-input[type=range],input[type=number],input[type=color],input[type=text],input[type=password]{width:100%}input[type=range]{accent-color:var(--accent)}input[type=number],input[type=text],input[type=password]{background:#091223;border:1px solid var(--line);color:var(--text);border-radius:14px;padding:12px 14px;font-size:1rem}input[type=color]{height:54px;background:transparent;border:none;padding:0}
+input[type=range],input[type=number],input[type=color],input[type=text],input[type=password]{width:100%}input[type=range]{accent-color:var(--accent)}input[type=number],input[type=text],input[type=password],select{background:#091223;border:1px solid var(--line);color:var(--text);border-radius:14px;padding:12px 14px;font-size:1rem}select{width:100%;appearance:none;cursor:pointer}input[type=color]{height:54px;background:transparent;border:none;padding:0}
 .row{display:grid;gap:14px;margin-top:16px}.chips{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}.chip{padding:10px 14px;border-radius:999px;background:#0b1730;border:1px solid var(--line);color:var(--muted);font-size:.92rem}
 .actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:18px}.btn{border:none;border-radius:16px;padding:14px 18px;font-weight:700;cursor:pointer;transition:transform .14s ease,opacity .14s ease}.btn:hover{transform:translateY(-1px)}.btn:disabled{opacity:.45;cursor:not-allowed;transform:none}.btn-primary{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#07111e}.btn-secondary{background:#0b1730;color:var(--text);border:1px solid var(--line)}.btn-danger{background:#35131a;color:#ffd4da;border:1px solid #7b2a3a}
 .toggle{display:flex;align-items:center;justify-content:space-between;background:#0b1730;border:1px solid var(--line);border-radius:16px;padding:14px 16px}.toggle input{width:22px;height:22px}
@@ -296,6 +297,22 @@ input[type=file]{width:100%;padding:12px 14px;background:#091223;border:1px dash
 <div class="label"><span>AP Password</span><span class="value">8-63 chars</span></div>
 <input id="configApPassword" type="password" maxlength="63" value="">
 </div>
+<div>
+<div class="label"><span>LED Data Pin</span><span class="value">XIAO pin</span></div>
+<select id="configGpio">
+<option value="0">D0 / GPIO 0</option>
+<option value="1">D1 / GPIO 1</option>
+<option value="2">D2 / GPIO 2</option>
+<option value="21">D3 / GPIO 21</option>
+<option value="22">D4 / GPIO 22</option>
+<option value="23">D5 / GPIO 23</option>
+<option value="16">D6 / GPIO 16</option>
+<option value="17">D7 / GPIO 17 (default)</option>
+<option value="19">D8 / GPIO 19</option>
+<option value="20">D9 / GPIO 20</option>
+<option value="18">D10 / GPIO 18</option>
+</select>
+</div>
 <label class="toggle"><span>Install published updates automatically</span><input id="configAutoInstall" type="checkbox" checked></label>
 </div>
 <div class="actions">
@@ -303,7 +320,7 @@ input[type=file]{width:100%;padding:12px 14px;background:#091223;border:1px dash
 <button class="btn btn-secondary" id="rebootBtn">Reset</button>
 </div>
 <div class="status" id="configStatus"></div>
-<div class="footer">New AP credentials are saved immediately but become active after a reset. With auto-install on, the device installs newer published releases on its own; off, it only checks and surfaces them for you to press Install Update.</div>
+<div class="footer">New AP credentials are saved immediately but become active after a reset. LED pin changes take effect immediately without a reset. With auto-install on, the device installs newer published releases on its own; off, it only checks and surfaces them for you to press Install Update.</div>
 </div>
 <div class="card">
 <h2>Firmware Actions</h2>
@@ -401,6 +418,7 @@ const configCountNumber = document.getElementById('configCountNumber');
 const configCountValue = document.getElementById('configCountValue');
 const configApSsid = document.getElementById('configApSsid');
 const configApPassword = document.getElementById('configApPassword');
+const configGpio = document.getElementById('configGpio');
 const configAutoInstall = document.getElementById('configAutoInstall');
 const controlBrightness = document.getElementById('controlBrightness');
 const controlColor = document.getElementById('controlColor');
@@ -477,10 +495,10 @@ function setLink(linkEl,url,emptyLabel){if(url){linkEl.href=url;linkEl.textConte
 function refreshOverview(data){overviewMatterStatus.textContent=data.commissioned?'Commissioned':'Ready to pair';overviewMatterEndpoint.textContent=data.matter_endpoint;overviewMatterFabricCount.textContent=(data.matter_fabric_count??'-');overviewMatterWindow.textContent=data.matter_window_open?'Open':'Closed';overviewManualCode.textContent=data.manual_code||'Unavailable';setLink(overviewQrLink,data.qr_url,'Unavailable');overviewApSsid.textContent=data.ap_ssid||'-';setLink(overviewApUrl,data.ap_url||(data.ap_ip?('http://'+data.ap_ip):''),'Unavailable');overviewStaStatus.textContent=data.sta_connected?'Connected':'Not connected';overviewStaSsid.textContent=data.sta_ssid||'-';overviewStaBssid.textContent=(data.sta_bssid||'-')+(data.sta_channel?(' / ch '+data.sta_channel):'');overviewStaRssi.textContent=(data.sta_rssi||data.sta_rssi===0)?(data.sta_rssi+' dBm'):'-';overviewStaReason.textContent=(data.sta_last_disconnect_reason&&data.sta_last_disconnect_reason!==0)?((data.sta_last_disconnect_reason_text||'unknown')+' ('+String(data.sta_last_disconnect_reason)+')'):'None';setLink(overviewLanUrl,data.lan_url||(data.sta_ip?('http://'+data.sta_ip):''),'Not connected');overviewApRestart.textContent=data.ap_restart_required?'Yes, reset to apply new AP config':'No';overviewFwVersion.textContent=data.fw_version||'unknown';overviewRunningPartition.textContent=data.running_partition||'-';overviewNextPartition.textContent=data.ota_target_partition||'-';overviewRevertTarget.textContent=data.revert_available?((data.revert_version||'unknown')+' @ '+(data.revert_partition||'')):'No previous firmware available';overviewPublishedVersion.textContent=data.auto_update_latest_version||'Unknown';overviewUpdateStatus.textContent=data.auto_update_status||'Idle'}
 function refreshFirmwarePanel(data){const cur=data.fw_version||'unknown';const avail=data.auto_update_latest_version||'';firmwareCurrentVersion.textContent=cur;firmwareAvailableVersion.textContent=avail?avail:'No update available';const canInstall=!!data.auto_update_available && !data.auto_update_busy && avail && avail!==cur;installUpdateBtn.disabled=!canInstall;installUpdateBtn.textContent=data.auto_update_busy?'Installing...':(canInstall?('Install Update '+avail):'Install Update');updateStatusLine.textContent=data.auto_update_status||'Idle'}
 function setOtaBusy(busy){otaBtn.disabled=busy;otaFile.disabled=busy;otaBtn.textContent=busy?'Uploading OTA...':'Install OTA Update'}
-function applyStateToUi(data){effectProfiles=normalizeEffectProfiles(data.effect_profiles);effectColors=normalizeEffectColors(data.effect_colors);selectedEffect=data.effect||'solid';syncConfigCount(data.count);configCount.max=data.max_leds;configCountNumber.max=data.max_leds;configApSsid.value=data.config_ap_ssid||data.ap_ssid||'';configApPassword.value=data.config_ap_password||'';if(typeof data.auto_install_enabled==='boolean'){configAutoInstall.checked=data.auto_install_enabled}controlBrightness.value=data.brightness;controlColor.value=data.color;revertBtn.disabled=!data.revert_available;refreshOverview(data);refreshFirmwarePanel(data);otaStatus.textContent='Next OTA slot: '+(data.ota_target_partition||'unknown')+'. Upload build/esp32c6_led_web.bin after the first USB flash.';syncEffectControls();updateControlReadout()}
+function applyStateToUi(data){effectProfiles=normalizeEffectProfiles(data.effect_profiles);effectColors=normalizeEffectColors(data.effect_colors);selectedEffect=data.effect||'solid';syncConfigCount(data.count);configCount.max=data.max_leds;configCountNumber.max=data.max_leds;configApSsid.value=data.config_ap_ssid||data.ap_ssid||'';configApPassword.value=data.config_ap_password||'';if(typeof data.auto_install_enabled==='boolean'){configAutoInstall.checked=data.auto_install_enabled}configGpio.value=String(data.gpio||17);controlBrightness.value=data.brightness;controlColor.value=data.color;revertBtn.disabled=!data.revert_available;refreshOverview(data);refreshFirmwarePanel(data);otaStatus.textContent='Next OTA slot: '+(data.ota_target_partition||'unknown')+'. Upload build/esp32c6_led_web.bin after the first USB flash.';syncEffectControls();updateControlReadout()}
 async function loadState(){controlStatus.textContent='Loading device state...';const res=await fetch('/api/state');if(!res.ok)throw new Error('Failed to load state');const data=await res.json();applyStateToUi(data);controlStatus.textContent='Device state loaded';configStatus.textContent=data.ap_restart_required?'Saved AP config is waiting for a reset.':'Configuration loaded'}
 async function saveControl(){controlStatus.textContent='Applying control...';stashEffectControls();const brightness=Number(controlBrightness.value);const payload={brightness:brightness,color:controlColor.value,effect:selectedEffect,effect_params:getSelectedEffectValues(),power:brightness>0};if((EFFECT_META[selectedEffect].colors||[])[0]){payload.effect_color=getSelectedEffectColor()}const res=await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!res.ok)throw new Error(await res.text()||'Failed to apply control');const data=await res.json();applyStateToUi(data);controlStatus.textContent='Control saved'}
-async function saveConfig(){configStatus.textContent='Saving configuration...';const payload={count:Number(configCount.value),ap_ssid:configApSsid.value.trim(),ap_password:configApPassword.value,auto_install_enabled:!!configAutoInstall.checked};const res=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!res.ok)throw new Error(await res.text()||'Failed to save configuration');const data=await res.json();applyStateToUi(data);configStatus.textContent=data.ap_restart_required?'Configuration saved. Press Reset to apply the new AP credentials.':'Configuration saved'}
+async function saveConfig(){configStatus.textContent='Saving configuration...';const payload={count:Number(configCount.value),ap_ssid:configApSsid.value.trim(),ap_password:configApPassword.value,auto_install_enabled:!!configAutoInstall.checked,led_gpio:Number(configGpio.value)};const res=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!res.ok)throw new Error(await res.text()||'Failed to save configuration');const data=await res.json();applyStateToUi(data);configStatus.textContent=data.ap_restart_required?'Configuration saved. Press Reset to apply the new AP credentials.':'Configuration saved'}
 async function uploadOta(){const file=otaFile.files&&otaFile.files[0];if(!file)throw new Error('Choose a firmware .bin file first');setOtaBusy(true);otaStatus.textContent='Uploading '+file.name+' ('+file.size+' bytes)...';const res=await fetch('/api/ota',{method:'POST',headers:{'Content-Type':'application/octet-stream','X-Filename':file.name},body:file});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok)throw new Error(data.message||text||'OTA update failed');otaStatus.textContent=data.message||'Update installed. Device will restart.';actionStatus.textContent='OTA accepted. Reconnect after reboot.';setTimeout(()=>window.location.reload(),12000)}
 async function postAction(url,statusEl,confirmText){if(confirmText&&!window.confirm(confirmText))return;statusEl.textContent='Sending command...';const res=await fetch(url,{method:'POST'});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok)throw new Error(data.message||text||'Action failed');statusEl.textContent=data.message||'Command sent';setTimeout(()=>window.location.reload(),12000)}
 async function checkPublishedUpdate(){updateStatusLine.textContent='Checking GitHub for the latest release...';const res=await fetch('/api/check-update',{method:'POST'});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok)throw new Error(data.message||text||'Published update check failed');updateStatusLine.textContent=data.message||'Check queued';setTimeout(()=>loadState().catch(err=>updateStatusLine.textContent=err.message),3000)}
@@ -2019,6 +2037,7 @@ static esp_err_t save_state_to_nvs(const led_state_t *state)
                       "save auto_install_enabled failed");
     ESP_GOTO_ON_ERROR(nvs_set_str(nvs_handle, "ap_ssid", s_ap_ssid), cleanup, TAG, "save ap ssid failed");
     ESP_GOTO_ON_ERROR(nvs_set_str(nvs_handle, "ap_pass", s_ap_password), cleanup, TAG, "save ap password failed");
+    ESP_GOTO_ON_ERROR(nvs_set_u8(nvs_handle, "led_gpio", s_led_gpio), cleanup, TAG, "save led_gpio failed");
     for (uint8_t effect = 0; effect < LED_EFFECT_COUNT; ++effect) {
         for (size_t index = 0; index < kEffectParamSlotCount; ++index) {
             std::snprintf(key, sizeof(key), "e%u_p%u", effect, static_cast<unsigned>(index));
@@ -2073,6 +2092,8 @@ static bool load_state_from_nvs()
     nvs_get_u8(nvs_handle, "auto_inst", &auto_install);
     nvs_get_str(nvs_handle, "ap_ssid", s_ap_ssid, &ssid_len);
     nvs_get_str(nvs_handle, "ap_pass", s_ap_password, &pass_len);
+    uint8_t led_gpio = s_led_gpio;
+    nvs_get_u8(nvs_handle, "led_gpio", &led_gpio);
     for (uint8_t loaded_effect = 0; loaded_effect < LED_EFFECT_COUNT; ++loaded_effect) {
         for (size_t index = 0; index < kEffectParamSlotCount; ++index) {
             std::snprintf(key, sizeof(key), "e%u_p%u", loaded_effect, static_cast<unsigned>(index));
@@ -2095,6 +2116,7 @@ static bool load_state_from_nvs()
     s_led_state.power = power != 0;
     s_led_state.effect = effect;
     set_auto_install_enabled(auto_install != 0);
+    s_led_gpio = led_gpio;
     clamp_state(&s_led_state);
     refresh_matter_hs_trackers_from_rgb(s_led_state.red, s_led_state.green, s_led_state.blue);
     return true;
@@ -2373,7 +2395,7 @@ static esp_err_t send_state_json(httpd_req_t *req)
     }
     cJSON_AddBoolToObject(root, "power", snapshot.power);
     cJSON_AddNumberToObject(root, "max_leds", APP_LED_MAX_PIXELS);
-    cJSON_AddNumberToObject(root, "gpio", APP_LED_GPIO);
+    cJSON_AddNumberToObject(root, "gpio", s_led_gpio);
     cJSON_AddStringToObject(root, "ap_ssid", s_runtime_ap_ssid);
     cJSON_AddStringToObject(root, "ap_ip", s_ap_ip);
     cJSON_AddStringToObject(root, "ap_url", ap_url);
@@ -2572,6 +2594,8 @@ static esp_err_t control_post_handler(httpd_req_t *req)
     return send_state_json(req);
 }
 
+static esp_err_t reinit_led_strip_locked(uint8_t new_gpio);
+
 static esp_err_t config_post_handler(httpd_req_t *req)
 {
     if (req->content_len <= 0 || req->content_len >= APP_POST_BODY_LIMIT) {
@@ -2595,6 +2619,7 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     cJSON *ap_ssid = cJSON_GetObjectItemCaseSensitive(root, "ap_ssid");
     cJSON *ap_password = cJSON_GetObjectItemCaseSensitive(root, "ap_password");
     cJSON *auto_install = cJSON_GetObjectItemCaseSensitive(root, "auto_install_enabled");
+    cJSON *led_gpio_json = cJSON_GetObjectItemCaseSensitive(root, "led_gpio");
     if (!cJSON_IsNumber(count) || !cJSON_IsString(ap_ssid) || !cJSON_IsString(ap_password)) {
         cJSON_Delete(root);
         httpd_resp_set_status(req, "400 Bad Request");
@@ -2607,6 +2632,16 @@ static esp_err_t config_post_handler(httpd_req_t *req)
         return httpd_resp_sendstr(req, "AP SSID must be 1-32 chars and password must be 8-63 chars");
     }
 
+    int new_gpio = -1;
+    if (cJSON_IsNumber(led_gpio_json)) {
+        new_gpio = static_cast<int>(led_gpio_json->valuedouble);
+        if (new_gpio < 0 || new_gpio > 30 || new_gpio == 10 || new_gpio == 11 || new_gpio == 12 || new_gpio == 13) {
+            cJSON_Delete(root);
+            httpd_resp_set_status(req, "400 Bad Request");
+            return httpd_resp_sendstr(req, "Invalid GPIO: must be 0-30 excluding 10-13");
+        }
+    }
+
     esp_err_t err = ESP_OK;
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     s_led_state.count = static_cast<uint16_t>(count->valuedouble);
@@ -2616,7 +2651,13 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     if (cJSON_IsBool(auto_install)) {
         s_auto_install_enabled = cJSON_IsTrue(auto_install);
     }
-    err = apply_led_state_locked(&s_led_state);
+    if (new_gpio >= 0 && static_cast<uint8_t>(new_gpio) != s_led_gpio) {
+        err = reinit_led_strip_locked(static_cast<uint8_t>(new_gpio));
+        ESP_LOGI(TAG, "LED strip reinitialized on GPIO %d (err=%d)", new_gpio, err);
+    }
+    if (err == ESP_OK) {
+        err = apply_led_state_locked(&s_led_state);
+    }
     if (err == ESP_OK) {
         err = save_state_to_nvs(&s_led_state);
     }
@@ -3279,7 +3320,7 @@ static void start_softap_overlay()
 static void init_led_strip()
 {
     led_strip_config_t strip_config = {};
-    strip_config.strip_gpio_num = APP_LED_GPIO;
+    strip_config.strip_gpio_num = s_led_gpio;
     strip_config.max_leds = APP_LED_MAX_PIXELS;
 
     led_strip_rmt_config_t rmt_config = {};
@@ -3288,6 +3329,29 @@ static void init_led_strip()
 
     ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &s_led_strip));
     ESP_ERROR_CHECK(led_strip_clear(s_led_strip));
+}
+
+static esp_err_t reinit_led_strip_locked(uint8_t new_gpio)
+{
+    led_strip_clear(s_led_strip);
+    led_strip_refresh(s_led_strip);
+    led_strip_del(s_led_strip);
+    s_led_strip = nullptr;
+    s_led_gpio = new_gpio;
+
+    led_strip_config_t strip_config = {};
+    strip_config.strip_gpio_num = s_led_gpio;
+    strip_config.max_leds = APP_LED_MAX_PIXELS;
+
+    led_strip_rmt_config_t rmt_config = {};
+    rmt_config.resolution_hz = APP_RMT_RESOLUTION_HZ;
+    rmt_config.flags.with_dma = false;
+
+    esp_err_t err = led_strip_new_rmt_device(&strip_config, &rmt_config, &s_led_strip);
+    if (err == ESP_OK) {
+        led_strip_clear(s_led_strip);
+    }
+    return err;
 }
 
 static esp_err_t app_identification_cb(identification::callback_type_t type, uint16_t endpoint_id, uint8_t effect_id,
