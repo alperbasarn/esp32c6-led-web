@@ -7,13 +7,15 @@ It exposes the strip in two ways:
 - A local web page for LED count, color, brightness, effects, OTA, and reset actions
 - A Matter extended color light endpoint for Apple Home
 - Local OTA firmware upload from the same web page (manual `.bin` install)
-- Periodic background checks against the latest published GitHub release; user-triggered install with a signed-manifest verification chain
+- Periodic background checks against the latest published GitHub release; manual or automatic install with a signed-manifest verification chain
 - A firmware revert action that boots back into the other OTA slot
 - A factory reset action that clears Matter pairing, Wi-Fi AP config, and saved LED settings
 - Built-in LED effects: `glow`, `rainbow`, `chase`, `sparkle`, `wave`
 - Per-effect controls in the web UI with unique meanings for each animation
 
 The firmware starts a Wi-Fi SoftAP, serves the control page directly from the board, and includes captive-portal style redirects plus a small DNS responder so phones and laptops are more likely to open the page automatically. After the device joins your normal Wi-Fi through Matter commissioning, the same web UI is also reachable on its LAN IP.
+
+Maintainer-oriented runtime ownership and update-flow notes are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Defaults
 
@@ -50,7 +52,7 @@ idf.py -p COM6 flash monitor                  # Windows
 
 **The first install needs a USB flash.** After that, the device can pull new firmware over the air — either by uploading a `.bin` you built locally (Configuration → Install From File) or, more usually, by waiting for the next published GitHub release and pressing Install Update.
 
-For first-time USB flash, the CI workflow publishes `bootloader.bin`, `partition-table.bin`, `ota_data_initial.bin` (you'll generate this locally), and `esp32c6_led_web.bin` to every GitHub release. You can flash all four with esptool directly without a local toolchain:
+For first-time USB flash, the CI workflow publishes `bootloader.bin`, `partition-table.bin`, `ota_data_initial.bin`, and `esp32c6_led_web.bin` to every GitHub release. You can flash all four with esptool directly without a local toolchain:
 
 ```bash
 python -m esptool --chip esp32c6 -p COM6 -b 460800 --before default-reset --after hard-reset \
@@ -69,7 +71,9 @@ The device page is split into three tabs:
 - `Configuration`: LED count, SoftAP SSID/password, the Firmware Update card (Current vs. Available version, **Install Update** button, Check For Updates button, and a manual **Install From File** path), revert button, factory reset, reboot
 - `Control`: brightness, color, and one sub-tab per effect with its own parameters
 
-The SoftAP credentials shown in `Configuration` are the credentials hosted by the ESP32-C6 itself for the local setup page. On a fresh device they are generated automatically and printed to the serial log when the AP starts.
+The SoftAP SSID and password are the credentials hosted by the ESP32-C6 itself for the local setup page. On a fresh device they are generated automatically and printed to the serial log when the AP starts.
+
+The LAN page is intended for status and LED control. Configuration, firmware updates, reboot, revert, and factory reset are restricted to a client connected to the device SoftAP. The AP password is never returned by the state API; leave the password field blank to keep the current password.
 
 ## Pair with Apple Home
 
@@ -86,7 +90,7 @@ The local web page also shows the current Matter state, manual setup code, QR UR
 
 There are two OTA paths in the firmware:
 
-**Install From File (dev escape hatch).** Build a `.bin` locally with `idf.py build`, open the device web UI, in the `Firmware Update` card choose your file, click `Install From File`. The device writes the bytes to the inactive OTA slot and reboots into it. No signature verification on this path — it bypasses the manifest-trust chain by design so you can recover a stuck device or test pre-release builds. **Do not use this path to ship firmware to anyone but yourself.**
+**Install From File (dev escape hatch).** Build a `.bin` locally with `idf.py build`, connect to the device SoftAP, open the device web UI, choose your file, and click `Install From File`. The device writes the bytes to the inactive OTA slot, records an OTA probation marker, reboots into it, and promotes it only after the normal self-test. No manifest signature verification is performed on this path — it bypasses the release trust chain by design so you can test pre-release builds. **Do not use this path to ship firmware to anyone but yourself.**
 
 **Install Update (published-release flow).** The device periodically (every `CONFIG_APP_UPDATE_INTERVAL_HOURS`, default 6 h) fetches `manifest.json` from the latest GitHub release and verifies its ECDSA P-256 signature. If a newer version is available, the Firmware Update card shows the version and enables an `Install Update` button. Pressing the button downloads the binary, SHA-256-verifies it against the manifest, switches the boot partition, reboots, and runs a 2-strike self-test before promoting the image to permanent. See the next section.
 
@@ -118,7 +122,7 @@ So a broken release has three layers of defense:
 | Boots, but Wi-Fi/Matter never come up                  | self-test timeout (×2)   |
 | Panics or hangs the watchdog before self-test runs    | next boot's strike count |
 
-Each device's first poll is jittered randomly in `[0, CONFIG_APP_UPDATE_INITIAL_JITTER_MIN]` minutes after Wi-Fi up. The `Check For Updates` button bypasses the jitter. The check is automatic and periodic; install is always manual.
+Each device's first poll is jittered randomly in `[0, CONFIG_APP_UPDATE_INITIAL_JITTER_MIN]` minutes after Wi-Fi up. The `Check For Updates` button bypasses the jitter. When automatic installation is enabled, in-cohort devices install newer releases after the periodic check; when it is disabled, the device only reports the update and installation requires the `Install Update` button.
 
 ### Publishing a release
 
@@ -128,11 +132,14 @@ To cut a release:
 
 1. Bump `PROJECT_VER` in [`CMakeLists.txt`](CMakeLists.txt). The new value is what the device's `esp_app_get_description()->version` will report.
 2. Commit and push to `main`. The push triggers the `Publish Firmware` workflow which builds + warms the CI cache (no release artifacts attached on push).
-3. `gh release create vX.Y --generate-notes --title "X.Y"`. This fires the workflow on the `release: published` event.
+3. Create a published release whose tag, after an optional leading `v`, exactly matches `PROJECT_VER`; for example, `gh release create v1.6 --generate-notes --title "1.6"`. This fires the workflow on the `release: published` event. CI stops before uploading anything if the tag and built app version differ.
 4. The workflow builds the app (`idf.py set-target esp32c6 build`), then runs [`scripts/generate-manifest.sh`](scripts/generate-manifest.sh) which produces `manifest.json` + `manifest.json.sig` and uploads:
    - `esp32c6_led_web.bin` — the OTA application image
    - `bootloader.bin`, `partition-table.bin` — needed for first-time USB flashes
+   - `ota_data_initial.bin` — initial OTA slot metadata for first-time USB flashes
    - `manifest.json`, `manifest.json.sig` — what devices read
+
+Before release upload, CI also checks that every artifact is non-empty, the manifest hash/size/URL match the exact application image, and the detached signature verifies against the public key embedded in the firmware source.
 
 Pinned versions live in workflow env (`IDF_VERSION`, `ESP_MATTER_REF`). If you upgrade the Matter stack or IDF, bump them in [`.github/workflows/publish-firmware.yml`](.github/workflows/publish-firmware.yml) so CI matches what you build locally.
 
@@ -141,6 +148,8 @@ ESP-IDF is cached in CI under the `main` branch scope (no per-tag re-clone). esp
 ### Signing key management
 
 The release manifest is signed by `scripts/generate-manifest.sh` using an ECDSA P-256 private key passed via the `MANIFEST_SIGNING_KEY` repository secret. The matching public key is embedded in firmware at [`main/include/release_pubkey.h`](main/include/release_pubkey.h).
+
+The generator rejects missing or malformed signing keys and refuses keys that are not on the P-256 `prime256v1` curve. It also self-verifies the generated signature; the workflow then verifies it again against the embedded public key before uploading release assets.
 
 To rotate keys:
 
@@ -159,7 +168,7 @@ To bootstrap a fresh fork: generate a new keypair as above, replace the placehol
 
 ## Reset options
 
-- `Reset`: reboots the device and applies any saved SoftAP credential changes
+- `Reboot`: reboots the device and applies any saved SoftAP credential changes
 - `Factory Reset`: clears the app settings namespace, then runs the Matter factory reset flow so pairing data and local settings are removed cleanly
 - `Revert To Previous Firmware`: switches boot to the other OTA app slot without erasing settings
 

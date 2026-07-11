@@ -21,6 +21,7 @@ env:
   MANIFEST_SIG_ASSET_NAME: manifest.json.sig
   BOOTLOADER_ASSET_NAME: bootloader.bin
   PARTITION_TABLE_ASSET_NAME: partition-table.bin
+  OTA_DATA_INITIAL_ASSET_NAME: ota_data_initial.bin
 
 jobs:
   build-and-publish:
@@ -117,6 +118,25 @@ jobs:
           source "$IDF_PATH/export.sh" >/dev/null
           cd "$GITHUB_WORKSPACE"
           idf.py set-target esp32c6 build
+          grep -q '^CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y$' sdkconfig
+          grep -q '^CONFIG_APP_OTA_SIG_VERIFY=y$' sdkconfig
+
+      - name: Validate release version
+        if: github.event_name == 'release'
+        id: release-metadata
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          test -s build/project_description.json
+          app_version="$(python -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' build/project_description.json)"
+          release_version="${RELEASE_TAG#v}"
+          if [[ -z "$app_version" || "$release_version" != "$app_version" ]]; then
+            echo "Release tag $RELEASE_TAG does not match built app version $app_version" >&2
+            exit 1
+          fi
+          echo "version=$app_version" >> "$GITHUB_OUTPUT"
 
       - name: Generate signed manifest
         if: github.event_name == 'release'
@@ -127,10 +147,81 @@ jobs:
           IDF_REF: ${{ env.IDF_VERSION }}
           MATTER_REF: ${{ env.ESP_MATTER_REF }}
           APP_BIN: build/${{ env.FIRMWARE_ASSET_NAME }}
+          APP_VERSION: ${{ steps.release-metadata.outputs.version }}
           SIGNING_KEY_PEM: ${{ secrets.MANIFEST_SIGNING_KEY }}
         run: |
           chmod +x scripts/generate-manifest.sh
           scripts/generate-manifest.sh
+
+      - name: Verify release bundle
+        if: github.event_name == 'release'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          REPO_SLUG: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          for artifact in \
+            "build/$FIRMWARE_ASSET_NAME" \
+            "build/bootloader/$BOOTLOADER_ASSET_NAME" \
+            "build/partition_table/$PARTITION_TABLE_ASSET_NAME" \
+            "build/$OTA_DATA_INITIAL_ASSET_NAME" \
+            "$MANIFEST_ASSET_NAME" \
+            "$MANIFEST_SIG_ASSET_NAME"; do
+            test -s "$artifact" || { echo "Missing or empty release artifact: $artifact" >&2; exit 1; }
+          done
+
+          pubkey_file="$(mktemp)"
+          trap 'rm -f "$pubkey_file"' EXIT
+          python - "$pubkey_file" "$RELEASE_TAG" "$REPO_SLUG" "$FIRMWARE_ASSET_NAME" <<'PY'
+          import ast
+          import hashlib
+          import json
+          import sys
+          from pathlib import Path
+
+          pubkey_file, release_tag, repo_slug, asset_name = sys.argv[1:]
+          release_version = release_tag.removeprefix("v")
+          manifest_path = Path("manifest.json")
+          app_path = Path("build") / asset_name
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+          if manifest.get("version") != release_version:
+              raise SystemExit(f"manifest version {manifest.get('version')!r} != release version {release_version!r}")
+          if manifest.get("chip") != "esp32c6":
+              raise SystemExit("manifest chip is not esp32c6")
+          for field in ("idf_ref", "matter_ref"):
+              if not isinstance(manifest.get(field), str) or not manifest[field]:
+                  raise SystemExit(f"manifest field {field!r} is missing")
+
+          app = manifest.get("app")
+          if not isinstance(app, dict):
+              raise SystemExit("manifest app object is missing")
+          expected_url = f"https://github.com/{repo_slug}/releases/download/{release_tag}/{asset_name}"
+          if app.get("url") != expected_url:
+              raise SystemExit(f"manifest URL {app.get('url')!r} != expected URL {expected_url!r}")
+          actual_sha256 = hashlib.sha256(app_path.read_bytes()).hexdigest()
+          if app.get("sha256") != actual_sha256:
+              raise SystemExit("manifest SHA-256 does not match the published application image")
+          if app.get("size") != app_path.stat().st_size:
+              raise SystemExit("manifest size does not match the published application image")
+
+          rollout = manifest.get("rollout")
+          if not isinstance(rollout, dict) or not isinstance(rollout.get("percent"), int) or not 0 <= rollout["percent"] <= 100:
+              raise SystemExit("manifest rollout.percent must be an integer from 0 through 100")
+
+          pem_parts = []
+          for raw_line in Path("main/include/release_pubkey.h").read_text(encoding="utf-8").splitlines():
+              line = raw_line.strip().rstrip(";")
+              if line.startswith('"'):
+                  pem_parts.append(ast.literal_eval(line))
+          pem = "".join(pem_parts)
+          if not pem.startswith("-----BEGIN PUBLIC KEY-----\n") or not pem.endswith("-----END PUBLIC KEY-----\n"):
+              raise SystemExit("could not extract a PEM public key from main/include/release_pubkey.h")
+          Path(pubkey_file).write_text(pem, encoding="ascii", newline="")
+          PY
+          openssl dgst -sha256 -verify "$pubkey_file" \
+            -signature "$MANIFEST_SIG_ASSET_NAME" "$MANIFEST_ASSET_NAME"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
@@ -140,6 +231,7 @@ jobs:
             build/esp32c6_led_web.bin
             build/bootloader/bootloader.bin
             build/partition_table/partition-table.bin
+            build/ota_data_initial.bin
             build/project_description.json
             manifest.json
             manifest.json.sig
@@ -158,10 +250,13 @@ jobs:
           # Bootloader + partition table for first-time USB flashing.
           gh release upload "$RELEASE_TAG" \
             "build/bootloader/$BOOTLOADER_ASSET_NAME" \
-            "build/partition_table/$PARTITION_TABLE_ASSET_NAME" --clobber || true
+            "build/partition_table/$PARTITION_TABLE_ASSET_NAME" --clobber
+
+          # ota_data_initial is required for a complete first-time USB flash.
+          gh release upload "$RELEASE_TAG" \
+            "build/$OTA_DATA_INITIAL_ASSET_NAME" --clobber
 
           # Signed manifest (devices fetch via /releases/latest/download/manifest.json).
           gh release upload "$RELEASE_TAG" "$MANIFEST_ASSET_NAME" --clobber
-          if [ -f "$MANIFEST_SIG_ASSET_NAME" ]; then
-            gh release upload "$RELEASE_TAG" "$MANIFEST_SIG_ASSET_NAME" --clobber
-          fi
+          test -s "$MANIFEST_SIG_ASSET_NAME"
+          gh release upload "$RELEASE_TAG" "$MANIFEST_SIG_ASSET_NAME" --clobber
