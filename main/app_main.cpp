@@ -946,8 +946,12 @@ static esp_err_t verify_manifest_signature(const uint8_t *msg, size_t msg_len,
                                             const uint8_t *sig, size_t sig_len)
 {
 #if CONFIG_APP_OTA_SIG_VERIFY
+    // A production build compiled with signature verification MUST embed a key.
+    // Catch an empty release_pubkey.h at build time so it can never ship.
+    static_assert(sizeof(kReleasePubKeyPem) > 1,
+                  "release_pubkey.h has no key but CONFIG_APP_OTA_SIG_VERIFY is enabled");
     if (kReleasePubKeyPemLen == 0) {
-        ESP_LOGW(TAG, "No release public key embedded; signature check skipped.");
+        ESP_LOGE(TAG, "No release public key embedded but sig-verify enabled — refusing.");
         return ESP_ERR_INVALID_STATE;
     }
     if (!msg || !sig || sig_len == 0) {
@@ -1143,7 +1147,16 @@ static esp_err_t fetch_latest_published_update(published_update_info_t *info)
     }
 
 #if CONFIG_APP_OTA_SIG_VERIFY
-    if (kReleasePubKeyPemLen > 0) {
+    // Signature verification is compiled in, so an update can NEVER be trusted
+    // without a key. If the embedded key is empty we refuse rather than silently
+    // installing an unverified image (the old `if (len > 0)` guard skipped the
+    // check entirely in that case).
+    if (kReleasePubKeyPemLen == 0) {
+        ESP_LOGE(TAG, "CONFIG_APP_OTA_SIG_VERIFY=y but no release public key embedded — refusing update");
+        free(manifest_bytes);
+        return ESP_ERR_INVALID_STATE;
+    }
+    {
         uint8_t *sig_bytes = nullptr;
         size_t   sig_len = 0;
         err = fetch_https_bytes(sig_url, &sig_bytes, &sig_len, APP_AUTO_UPDATE_SIG_LIMIT, "application/octet-stream");
@@ -1401,36 +1414,81 @@ static esp_err_t install_https_ota_with_verify(const published_update_info_t *in
     esp_https_ota_config_t ota_config = {};
     ota_config.http_config = &http_config;
 
+    // esp_https_ota has no true resume — each attempt re-downloads from the
+    // start — but GitHub/S3 occasionally reset the TLS connection mid-transfer.
+    // Mirror fetch_https_bytes' bounded retry so a transient network blip does
+    // not fail the whole install. Every failed attempt aborts (or finishes) its
+    // handle before the next begin() so no partition write is left dangling.
+    constexpr int kMaxOtaAttempts = 3;
     esp_https_ota_handle_t handle = nullptr;
-    esp_err_t err = esp_https_ota_begin(&ota_config, &handle);
-    if (err != ESP_OK || handle == nullptr) {
-        ESP_LOGE(TAG, "esp_https_ota_begin failed: %s", esp_err_to_name(err));
-        return err == ESP_OK ? ESP_FAIL : err;
-    }
-
-    while (true) {
-        err = esp_https_ota_perform(handle);
-        if (err != ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
-            break;
+    esp_err_t err = ESP_FAIL;
+    int image_len = 0;
+    for (int attempt = 1; attempt <= kMaxOtaAttempts; ++attempt) {
+        handle = nullptr;
+        err = esp_https_ota_begin(&ota_config, &handle);
+        if (err != ESP_OK || handle == nullptr) {
+            ESP_LOGE(TAG, "esp_https_ota_begin failed: %s (attempt %d/%d)",
+                     esp_err_to_name(err), attempt, kMaxOtaAttempts);
+            if (handle) {
+                esp_https_ota_abort(handle);
+                handle = nullptr;
+            }
+            err = (err == ESP_OK) ? ESP_FAIL : err;
+            if (attempt < kMaxOtaAttempts) {
+                vTaskDelay(pdMS_TO_TICKS(750));
+                continue;
+            }
+            return err;
         }
-    }
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_https_ota_perform failed: %s", esp_err_to_name(err));
-        esp_https_ota_abort(handle);
-        return err;
-    }
 
-    if (!esp_https_ota_is_complete_data_received(handle)) {
-        ESP_LOGE(TAG, "OTA stream ended before all data received");
-        esp_https_ota_abort(handle);
-        return ESP_FAIL;
-    }
+        while (true) {
+            err = esp_https_ota_perform(handle);
+            if (err != ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
+                break;
+            }
+        }
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_https_ota_perform failed: %s (attempt %d/%d)",
+                     esp_err_to_name(err), attempt, kMaxOtaAttempts);
+            esp_https_ota_abort(handle);
+            handle = nullptr;
+            if (attempt < kMaxOtaAttempts) {
+                vTaskDelay(pdMS_TO_TICKS(750));
+                continue;
+            }
+            return err;
+        }
 
-    int image_len = esp_https_ota_get_image_size(handle);
-    err = esp_https_ota_finish(handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_https_ota_finish failed: %s", esp_err_to_name(err));
-        return err;
+        if (!esp_https_ota_is_complete_data_received(handle)) {
+            ESP_LOGE(TAG, "OTA stream ended before all data received (attempt %d/%d)",
+                     attempt, kMaxOtaAttempts);
+            esp_https_ota_abort(handle);
+            handle = nullptr;
+            err = ESP_FAIL;
+            if (attempt < kMaxOtaAttempts) {
+                vTaskDelay(pdMS_TO_TICKS(750));
+                continue;
+            }
+            return err;
+        }
+
+        image_len = esp_https_ota_get_image_size(handle);
+        // esp_https_ota_finish releases the handle (even on error), so we do
+        // NOT abort it afterwards; just clear our copy and retry from begin().
+        err = esp_https_ota_finish(handle);
+        handle = nullptr;
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_https_ota_finish failed: %s (attempt %d/%d)",
+                     esp_err_to_name(err), attempt, kMaxOtaAttempts);
+            if (attempt < kMaxOtaAttempts) {
+                vTaskDelay(pdMS_TO_TICKS(750));
+                continue;
+            }
+            return err;
+        }
+        // Download + write + finish all succeeded — stop retrying and fall
+        // through to the size / SHA-256 read-back verification below.
+        break;
     }
 
     if (image_len <= 0) {
@@ -2706,7 +2764,7 @@ static void start_sntp_once()
         return;
     }
     s_sntp_started = true;
-    esp_netif_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG(APP_SNTP_SERVER);
+    esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG(APP_SNTP_SERVER);
     esp_err_t err = esp_netif_sntp_init(&config);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "SNTP init failed: %s", esp_err_to_name(err));
