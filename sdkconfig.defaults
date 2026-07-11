@@ -1,5 +1,11 @@
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
+# Optimize for size (-Os) rather than the IDF default -Og. The full feature set
+# (web UI, effects, Matter, dual-slot OTA, timers/schedules) overflows the
+# 0x1F0000 OTA app partition when built for debug; -Os reclaims tens of KB and
+# is the appropriate level for a release image.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
 # OTA rollback safety: bootloader marks a freshly flashed app as PENDING_VERIFY
 # and requires the app to call esp_ota_mark_app_valid_cancel_rollback() once
 # the self-test passes. Otherwise the next reboot rolls back to the previous slot.
