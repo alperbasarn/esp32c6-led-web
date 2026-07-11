@@ -13,6 +13,14 @@ FROM espressif/idf:v5.4.1
 ARG ESP_MATTER_REF=c6f767254f6267e057916981646a44c65d034254
 ENV ESP_MATTER_PATH=/opt/esp-matter
 
+# esp-matter's install.sh builds some Python C-extensions (notably cffi) from
+# source with --no-build-isolation. The slim espressif/idf image lacks the
+# headers/toolchain they need; the fat GitHub runner has them preinstalled,
+# which is why the clone-based workflow never hit this. Install them first.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential pkg-config python3-dev libffi-dev libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 # Shallow-fetch esp-matter at the pinned SHA, then shallow-init submodules. A
 # full recursive clone lands around 28-38 GB; the shallow path is what makes
 # this tractable.
