@@ -130,7 +130,7 @@ jobs:
         run: |
           set -euo pipefail
           test -s build/project_description.json
-          app_version="$(python -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' build/project_description.json)"
+          app_version="$(python -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["project_version"])' build/project_description.json)"
           release_version="${RELEASE_TAG#v}"
           if [[ -z "$app_version" || "$release_version" != "$app_version" ]]; then
             echo "Release tag $RELEASE_TAG does not match built app version $app_version" >&2

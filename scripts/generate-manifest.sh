@@ -57,7 +57,6 @@ done
 sha256=$(sha256sum "$APP_BIN" | awk '{print $1}')
 size=$(stat -c%s "$APP_BIN")
 asset_name=$(basename "$APP_BIN")
-released_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 asset_url="https://github.com/${REPO_SLUG}/releases/download/${RELEASE_TAG}/${asset_name}"
 
 python_bin="${PYTHON_BIN:-}"
