@@ -1,0 +1,51 @@
+# Builds and publishes the reusable firmware builder image to GHCR.
+#
+# Tag scheme: idf-<IDF_VERSION>-matter-<short-sha>
+#   e.g. idf-v5.4.1-matter-c6f7672
+# The image bakes ESP-IDF v5.4.1 + esp-matter @ c6f7672 so the publish job
+# doesn't clone/install esp-matter at runtime. Bumping IDF_VERSION or
+# ESP_MATTER_REF (in docker/builder.Dockerfile) means a NEW tag here and a
+# rebuild — update the tag below and the image reference in the publish job.
+#
+# One-time setup: after the first successful push, the GHCR package
+# `esp32c6-matter-builder` defaults to private. Either make it public once via
+# the package settings on GitHub, or have the publish job authenticate to GHCR
+# with GITHUB_TOKEN and `packages: read`.
+name: Build Builder Image
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - docker/builder.Dockerfile
+      - .github/workflows/build-builder-image.yml
+
+permissions:
+  packages: write
+  contents: read
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push builder image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: docker/builder.Dockerfile
+          push: true
+          tags: |
+            ghcr.io/alperbasarn/esp32c6-matter-builder:idf-v5.4.1-matter-c6f7672
+            ghcr.io/alperbasarn/esp32c6-matter-builder:latest
