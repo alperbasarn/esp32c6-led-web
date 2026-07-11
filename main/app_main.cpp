@@ -10,6 +10,7 @@
 #include <netinet/in.h>
 #include <sys/param.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "cJSON.h"
@@ -23,10 +24,12 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
+#include "esp_netif_sntp.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "esp_random.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -81,6 +84,9 @@
 #define APP_UPDATE_SHA256_HEX_LEN 64
 #define APP_UPDATE_SELF_TEST_TIMEOUT_MS ((uint64_t)CONFIG_APP_UPDATE_SELF_TEST_TIMEOUT_S * 1000ULL)
 #define APP_UPDATE_OTA_BUF_SIZE  1024
+#define APP_MAX_SCHEDULES        8
+#define APP_SNTP_SERVER          "pool.ntp.org"
+#define APP_TZ_DEFAULT           "UTC0"
 
 static const char *TAG = "matter_led";
 static constexpr auto kCommissioningTimeoutSeconds = 300;
@@ -201,6 +207,24 @@ static char s_auto_update_latest_version[APP_AUTO_UPDATE_VERSION_MAX] = "";
 static char s_auto_update_asset_url[APP_AUTO_UPDATE_URL_MAX] = "";
 static TaskHandle_t s_auto_update_task = nullptr;
 
+// Time-based automatic on/off. Fixed schedules persist in NVS and require a
+// valid wall clock (SNTP). The relative one-shot timer is in-RAM only and uses
+// a monotonic esp_timer deadline so it works without any time sync.
+typedef struct {
+    uint8_t enabled;
+    uint8_t hour;
+    uint8_t minute;
+    uint8_t days;    // bitmask, bit0=Sunday .. bit6=Saturday (0x7F = every day)
+    uint8_t action;  // 0=off, 1=on
+} schedule_entry_t;
+
+static schedule_entry_t s_schedules[APP_MAX_SCHEDULES] = {};
+static char s_tz[40] = APP_TZ_DEFAULT;
+static int64_t s_relative_deadline_us = 0;  // 0 = inactive (monotonic esp_timer deadline)
+static uint8_t s_relative_action = 0;       // 0=off, 1=on
+static int32_t s_sched_last_fired_min[APP_MAX_SCHEDULES] = {
+    -1, -1, -1, -1, -1, -1, -1, -1};        // epoch-minute of last fire (dedupe)
+
 static constexpr char INDEX_HTML[] = R"HTML(
 <!doctype html>
 <html lang="en">
@@ -209,35 +233,42 @@ static constexpr char INDEX_HTML[] = R"HTML(
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ESP32-C6 Matter LED</title>
 <style>
-:root{--bg:#08111f;--bg2:#0f1d35;--card:#101b2fcc;--line:#2f4a7d;--text:#eef4ff;--muted:#9db2d7;--accent:#6ee7ff;--accent2:#ffaf45;--good:#8ef3b0;--warn:#ffd36e}
-*{box-sizing:border-box}body{margin:0;font-family:Verdana,Segoe UI,sans-serif;color:var(--text);background:radial-gradient(circle at top left,#173057 0,#08111f 45%),linear-gradient(135deg,#08111f,#112748 60%,#1d4261);min-height:100vh}
+:root{--bg:#08111f;--bg2:#0f1d35;--card:#101b2fcc;--line:#2f4a7d;--text:#eef4ff;--muted:#aec2e6;--accent:#6ee7ff;--accent2:#ffaf45;--good:#8ef3b0;--warn:#ffd36e;--surface:#091223;--surface2:#0b1730;--surface3:#050c17;--on-accent:#07111e;--g0:#173057;--g1:#08111f;--g2:#112748;--g3:#1d4261}
+@media (prefers-color-scheme:light){:root{--bg:#eef3fb;--bg2:#dde7f5;--card:#ffffffd9;--line:#c2d2ea;--text:#0d1a2e;--muted:#3f5474;--accent:#0b6fbf;--accent2:#b45300;--good:#157a41;--warn:#f2b705;--surface:#f4f8ff;--surface2:#eaf1fb;--surface3:#e4ecf7;--on-accent:#ffffff;--g0:#dbe6f7;--g1:#eef3fb;--g2:#e2ecfa;--g3:#d5e3f6}}
+:root[data-theme="light"]{--bg:#eef3fb;--bg2:#dde7f5;--card:#ffffffd9;--line:#c2d2ea;--text:#0d1a2e;--muted:#3f5474;--accent:#0b6fbf;--accent2:#b45300;--good:#157a41;--warn:#f2b705;--surface:#f4f8ff;--surface2:#eaf1fb;--surface3:#e4ecf7;--on-accent:#ffffff;--g0:#dbe6f7;--g1:#eef3fb;--g2:#e2ecfa;--g3:#d5e3f6}
+:root[data-theme="dark"]{--bg:#08111f;--bg2:#0f1d35;--card:#101b2fcc;--line:#2f4a7d;--text:#eef4ff;--muted:#aec2e6;--accent:#6ee7ff;--accent2:#ffaf45;--good:#8ef3b0;--warn:#ffd36e;--surface:#091223;--surface2:#0b1730;--surface3:#050c17;--on-accent:#07111e;--g0:#173057;--g1:#08111f;--g2:#112748;--g3:#1d4261}
+*{box-sizing:border-box}body{margin:0;font-family:Verdana,Segoe UI,sans-serif;color:var(--text);background:radial-gradient(circle at top left,var(--g0) 0,var(--g1) 45%),linear-gradient(135deg,var(--g1),var(--g2) 60%,var(--g3));min-height:100vh}
 .wrap{max-width:1100px;margin:0 auto;padding:24px}.hero{padding:24px 0 16px}.hero h1{margin:0;font-size:clamp(2rem,5vw,3.6rem);letter-spacing:.04em;text-transform:uppercase}.hero p{margin:12px 0 0;color:var(--muted);max-width:62rem;line-height:1.6}
-.grid{display:grid;gap:18px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}.card{background:var(--card);backdrop-filter:blur(12px);border:1px solid var(--line);border-radius:22px;padding:20px;box-shadow:0 20px 50px rgba(0,0,0,.24)}
+.grid{display:grid;gap:18px;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr))}.card{background:var(--card);backdrop-filter:blur(12px);border:1px solid var(--line);border-radius:22px;padding:20px;box-shadow:0 20px 50px rgba(0,0,0,.24)}
 .label{display:flex;justify-content:space-between;align-items:center;color:var(--muted);font-size:.95rem;margin-bottom:10px}.value{color:var(--text);font-weight:700}.swatch{height:128px;border-radius:18px;border:1px solid rgba(255,255,255,.15);background:#ff6020;box-shadow:inset 0 0 50px rgba(255,255,255,.18),0 0 24px rgba(255,120,80,.35);transition:all .18s ease}
-input[type=range],input[type=number],input[type=color],input[type=text],input[type=password]{width:100%}input[type=range]{accent-color:var(--accent)}input[type=number],input[type=text],input[type=password]{background:#091223;border:1px solid var(--line);color:var(--text);border-radius:14px;padding:12px 14px;font-size:1rem}input[type=color]{height:54px;background:transparent;border:none;padding:0}
-.row{display:grid;gap:14px;margin-top:16px}.chips{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}.chip{padding:10px 14px;border-radius:999px;background:#0b1730;border:1px solid var(--line);color:var(--muted);font-size:.92rem}
-.actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:18px}.btn{border:none;border-radius:16px;padding:14px 18px;font-weight:700;cursor:pointer;transition:transform .14s ease,opacity .14s ease}.btn:hover{transform:translateY(-1px)}.btn:disabled{opacity:.45;cursor:not-allowed;transform:none}.btn-primary{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#07111e}.btn-secondary{background:#0b1730;color:var(--text);border:1px solid var(--line)}.btn-danger{background:#35131a;color:#ffd4da;border:1px solid #7b2a3a}
-.toggle{display:flex;align-items:center;justify-content:space-between;background:#0b1730;border:1px solid var(--line);border-radius:16px;padding:14px 16px}.toggle input{width:22px;height:22px}
-.status{margin-top:14px;min-height:24px;color:var(--good);font-weight:700}.footer{margin-top:18px;color:var(--muted);font-size:.92rem;line-height:1.6}.pairing{margin-top:16px;padding:16px;border-radius:18px;background:#091223;border:1px solid var(--line)}.pairing h2{margin:0 0 8px;font-size:1rem}.pairing p{margin:8px 0;color:var(--muted);line-height:1.5}.pairing code{display:block;padding:10px 12px;background:#050c17;border-radius:12px;color:var(--text);overflow:auto}.link{color:var(--accent);word-break:break-all}.stack{display:grid;gap:16px}
-.tabs,.effect-tabs{display:flex;flex-wrap:wrap;gap:10px}.tab-btn{border:none;border-radius:999px;padding:12px 18px;font-weight:700;cursor:pointer;background:#0b1730;color:var(--muted);border:1px solid var(--line)}.tab-btn.active{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#07111e}.panel{display:none;margin-top:18px}.panel.active{display:block}.kv{display:grid;gap:10px}.kv-line{display:flex;justify-content:space-between;gap:12px;padding:12px 14px;border-radius:14px;background:#091223;border:1px solid var(--line)}.kv-line span:first-child{color:var(--muted)}.kv-line span:last-child{text-align:right;word-break:break-word}
-input[type=file]{width:100%;padding:12px 14px;background:#091223;border:1px dashed var(--line);color:var(--text);border-radius:14px}
+input[type=range],input[type=number],input[type=color],input[type=text],input[type=password]{width:100%}input[type=range]{accent-color:var(--accent)}input[type=number],input[type=text],input[type=password]{background:var(--surface);border:1px solid var(--line);color:var(--text);border-radius:14px;padding:12px 14px;font-size:1rem}input[type=color]{height:54px;background:transparent;border:none;padding:0}
+.row{display:grid;gap:14px;margin-top:16px}.chips{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}.chip{padding:10px 14px;border-radius:999px;background:var(--surface2);border:1px solid var(--line);color:var(--muted);font-size:.92rem}
+.actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:18px}.btn{border:none;border-radius:16px;padding:14px 18px;font-weight:700;cursor:pointer;transition:transform .14s ease,opacity .14s ease}.btn:hover{transform:translateY(-1px)}.btn:disabled{opacity:.45;cursor:not-allowed;transform:none}.btn-primary{background:linear-gradient(135deg,var(--accent),var(--accent2));color:var(--on-accent)}.btn-secondary{background:var(--surface2);color:var(--text);border:1px solid var(--line)}.btn-danger{background:#35131a;color:#ffd4da;border:1px solid #7b2a3a}
+.toggle{display:flex;align-items:center;justify-content:space-between;background:var(--surface2);border:1px solid var(--line);border-radius:16px;padding:14px 16px}.toggle input{width:22px;height:22px}
+.status{margin-top:14px;min-height:24px;color:var(--good);font-weight:700}.footer{margin-top:18px;color:var(--muted);font-size:.92rem;line-height:1.6}.pairing{margin-top:16px;padding:16px;border-radius:18px;background:var(--surface);border:1px solid var(--line)}.pairing h2{margin:0 0 8px;font-size:1rem}.pairing p{margin:8px 0;color:var(--muted);line-height:1.5}.pairing code{display:block;padding:10px 12px;background:var(--surface3);border-radius:12px;color:var(--text);overflow:auto}.link{color:var(--accent);word-break:break-all}.stack{display:grid;gap:16px}
+.tabs,.effect-tabs{display:flex;flex-wrap:wrap;gap:10px}.tab-btn{border:none;border-radius:999px;padding:12px 18px;font-weight:700;cursor:pointer;background:var(--surface2);color:var(--muted);border:1px solid var(--line)}.tab-btn.active{background:linear-gradient(135deg,var(--accent),var(--accent2));color:var(--on-accent)}.panel{display:none;margin-top:18px}.panel.active{display:block}.kv{display:grid;gap:10px}.kv-line{display:flex;justify-content:space-between;gap:12px;padding:12px 14px;border-radius:14px;background:var(--surface);border:1px solid var(--line)}.kv-line span:first-child{color:var(--muted)}.kv-line span:last-child{text-align:right;word-break:break-word}
+input[type=file]{width:100%;padding:12px 14px;background:var(--surface);border:1px dashed var(--line);color:var(--text);border-radius:14px}
 button:focus-visible,input:focus-visible,a:focus-visible{outline:3px solid var(--accent);outline-offset:3px}@media (prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
 @media (max-width:640px){.wrap{padding:18px}.card{padding:16px}.actions{flex-direction:column}.btn{width:100%}.kv-line{flex-direction:column}}
+.banner{background:var(--warn);color:#241a00;border:1px solid var(--line);border-radius:14px;padding:12px 16px;margin-bottom:16px;font-weight:700}#otaProgress{width:100%;height:16px;margin-top:10px;accent-color:var(--accent)}.link[aria-disabled="true"]{opacity:.65;cursor:default;text-decoration:none}.stale .card{opacity:.42;filter:grayscale(.35);transition:opacity .2s ease,filter .2s ease}
+select{width:100%;background:var(--surface);border:1px solid var(--line);color:var(--text);border-radius:14px;padding:12px 14px;font-size:1rem}select:disabled{opacity:.45;cursor:not-allowed}.countdown{margin-top:16px;font-size:1.25rem;font-weight:700;color:var(--accent)}
+.sched-rows{display:grid;gap:10px;margin-top:14px}.sched-row{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:10px 12px;border-radius:14px;background:var(--surface);border:1px solid var(--line)}.sched-row input[type=time]{width:auto;flex:0 0 auto;background:var(--surface2);border:1px solid var(--line);color:var(--text);border-radius:10px;padding:8px 10px;font-size:1rem}.sched-row select{width:auto;flex:0 0 auto;padding:8px 10px}.sched-row input[type=checkbox]{width:20px;height:20px;flex:0 0 auto}.sched-days{display:flex;flex-wrap:wrap;gap:6px}.sched-days label{display:flex;flex-direction:column;align-items:center;gap:2px;font-size:.68rem;color:var(--muted);cursor:pointer}.sched-days input{width:16px;height:16px}.sched-time-line{margin-top:0;color:var(--muted);font-size:.92rem;line-height:1.5}
 </style>
 </head>
 <body>
 <div class="wrap">
+<div id="connBanner" class="banner" role="alert" aria-live="assertive" hidden>Device unreachable - reconnecting...</div>
 <section class="hero">
 <h1>ESP32-C6 LED Lab</h1>
 <p>Manage Matter status, Wi-Fi setup, firmware actions, and WS2812B control from one page with clear tabs so risky actions stay separate from daily lighting control.</p>
 </section>
-<div class="tabs">
-<button class="tab-btn active" data-main-tab="overview">Overview</button>
-<button class="tab-btn" data-main-tab="configuration">Configuration</button>
-<button class="tab-btn" data-main-tab="control">Control</button>
+<div class="tabs" role="tablist" aria-label="Primary sections">
+<button class="tab-btn active" data-main-tab="overview" role="tab" id="tab-overview" aria-controls="overviewPanel" aria-selected="true">Overview</button>
+<button class="tab-btn" data-main-tab="configuration" role="tab" id="tab-configuration" aria-controls="configurationPanel" aria-selected="false">Configuration</button>
+<button class="tab-btn" data-main-tab="control" role="tab" id="tab-control" aria-controls="controlPanel" aria-selected="false">Control</button>
 </div>
 
-<section class="panel active" id="overviewPanel">
+<section class="panel active" id="overviewPanel" role="tabpanel" aria-labelledby="tab-overview">
 <div class="grid">
 <div class="card">
 <h2>Matter State</h2>
@@ -247,7 +278,7 @@ button:focus-visible,input:focus-visible,a:focus-visible{outline:3px solid var(-
 <div class="kv-line"><span>Fabric Count</span><span id="overviewMatterFabricCount">-</span></div>
 <div class="kv-line"><span>Commissioning Window</span><span id="overviewMatterWindow">-</span></div>
 <div class="kv-line"><span>Manual Code</span><span id="overviewManualCode">-</span></div>
-<div class="kv-line"><span>QR Link</span><span><a class="link" id="overviewQrLink" href="#" target="_blank" rel="noopener">Unavailable</a></span></div>
+<div class="kv-line"><span>QR Link</span><span><a class="link" id="overviewQrLink" target="_blank" rel="noopener" aria-disabled="true">Unavailable</a></span></div>
 </div>
 <div class="footer">If the device is not yet in Apple Home, use the manual code or QR link while the commissioning window is open.</div>
 <div class="actions">
@@ -260,13 +291,13 @@ button:focus-visible,input:focus-visible,a:focus-visible{outline:3px solid var(-
 <h2>Wi-Fi State</h2>
 <div class="kv">
 <div class="kv-line"><span>Active AP SSID</span><span id="overviewApSsid">-</span></div>
-<div class="kv-line"><span>AP Web UI</span><span><a class="link" id="overviewApUrl" href="#" target="_blank" rel="noopener">Unavailable</a></span></div>
+<div class="kv-line"><span>AP Web UI</span><span><a class="link" id="overviewApUrl" target="_blank" rel="noopener" aria-disabled="true">Unavailable</a></span></div>
 <div class="kv-line"><span>Station Status</span><span id="overviewStaStatus">-</span></div>
 <div class="kv-line"><span>Station SSID</span><span id="overviewStaSsid">-</span></div>
 <div class="kv-line"><span>BSSID / Channel</span><span id="overviewStaBssid">-</span></div>
 <div class="kv-line"><span>Signal (RSSI)</span><span id="overviewStaRssi">-</span></div>
 <div class="kv-line"><span>Last Disconnect Reason</span><span id="overviewStaReason">-</span></div>
-<div class="kv-line"><span>LAN Web UI</span><span><a class="link" id="overviewLanUrl" href="#" target="_blank" rel="noopener">Unavailable</a></span></div>
+<div class="kv-line"><span>LAN Web UI</span><span><a class="link" id="overviewLanUrl" target="_blank" rel="noopener" aria-disabled="true">Unavailable</a></span></div>
 <div class="kv-line"><span>Restart Needed</span><span id="overviewApRestart">-</span></div>
 </div>
 </div>
@@ -284,26 +315,26 @@ button:focus-visible,input:focus-visible,a:focus-visible{outline:3px solid var(-
 </div>
 </section>
 
-<section class="panel" id="configurationPanel">
+<section class="panel" id="configurationPanel" role="tabpanel" aria-labelledby="tab-configuration">
 <div class="grid">
 <div class="card">
 <h2>Device Configuration</h2>
 <div class="row">
 <div>
 <div class="label"><span>LED Count</span><span class="value" id="configCountValue">0</span></div>
-<input id="configCount" type="range" min="1" max="120" step="1" value="8">
+<input id="configCount" type="range" min="1" max="120" step="1" value="8" aria-label="LED Count">
 </div>
 <div>
 <div class="label"><span>Exact Count</span><span class="value">Numeric input</span></div>
-<input id="configCountNumber" type="number" min="1" max="120" value="8">
+<input id="configCountNumber" type="number" min="1" max="120" value="8" aria-label="Exact LED count">
 </div>
 <div>
 <div class="label"><span>AP SSID</span><span class="value">1-32 chars</span></div>
-<input id="configApSsid" type="text" maxlength="32" value="">
+<input id="configApSsid" type="text" maxlength="32" value="" aria-label="AP SSID">
 </div>
 <div>
 <div class="label"><span>AP Password</span><span class="value">8-63 chars, blank keeps current</span></div>
-<input id="configApPassword" type="password" maxlength="63" placeholder="Leave blank to keep the current password" value="">
+<input id="configApPassword" type="password" maxlength="63" placeholder="Leave blank to keep the current password" value="" aria-label="AP Password (leave blank to keep current)">
 </div>
 <label class="toggle"><span>Install published updates automatically</span><input id="configAutoInstall" type="checkbox" checked></label>
 </div>
@@ -330,11 +361,12 @@ button:focus-visible,input:focus-visible,a:focus-visible{outline:3px solid var(-
 <p class="footer" id="updateStatusLine" role="status" aria-live="polite">Press <em>Check For Updates</em> to query GitHub now.</p>
 <hr style="border:none;border-top:1px solid var(--line);margin:14px 0">
 <p>Or upload a build of this project to install from your own binary.</p>
-<input id="otaFile" type="file" accept=".bin,application/octet-stream">
+<input id="otaFile" type="file" accept=".bin,application/octet-stream" aria-label="Firmware .bin file">
 <div class="actions">
 <button class="btn btn-secondary" id="otaBtn">Install From File</button>
 </div>
 <p class="footer" id="otaStatus" role="status" aria-live="polite">Use <code>build/esp32c6_led_web.bin</code> after the first USB flash.</p>
+<progress id="otaProgress" max="100" value="0" hidden></progress>
 </div>
 <div class="actions">
 <button class="btn btn-secondary" id="revertBtn">Revert To Previous Firmware</button>
@@ -342,36 +374,55 @@ button:focus-visible,input:focus-visible,a:focus-visible{outline:3px solid var(-
 </div>
 <div class="status" id="actionStatus" role="status" aria-live="polite"></div>
 </div>
+<div class="card">
+<h2>Schedules</h2>
+<div class="footer sched-time-line" id="scheduleTimeLine">Device time: loading...</div>
+<div class="row">
+<div>
+<div class="label"><span>Timezone (POSIX TZ)</span><span class="value">up to 39 chars</span></div>
+<input id="scheduleTz" type="text" maxlength="39" placeholder="e.g. CET-1CEST,M3.5.0,M10.5.0/3" aria-label="POSIX timezone">
+</div>
+</div>
+<div class="sched-rows" id="scheduleRows"></div>
+<div class="actions">
+<button class="btn btn-primary" id="saveScheduleBtn">Save Schedules</button>
+</div>
+<div class="status" id="scheduleStatus" role="status" aria-live="polite"></div>
+<div class="footer">Fixed schedules toggle power only (keeping color, brightness, and effect) and require internet time via SNTP. Disabled rows are still saved. Editing schedules is available from the device SoftAP.</div>
+</div>
 </div>
 </section>
 
-<section class="panel" id="controlPanel">
+<section class="panel" id="controlPanel" role="tabpanel" aria-labelledby="tab-control">
 <div class="card">
 <div class="row">
 <div>
 <div class="label"><span>Brightness</span><span class="value" id="brightnessValue">0</span></div>
-<input id="controlBrightness" type="range" min="0" max="255" step="1" value="96">
+<input id="controlBrightness" type="range" min="0" max="255" step="1" value="96" aria-label="Brightness">
 </div>
 <div>
 <div class="label"><span>Color</span><span class="value" id="controlColorValue">#FF6020</span></div>
-<input id="controlColor" type="color" value="#ff6020">
+<input id="controlColor" type="color" value="#ff6020" aria-label="Color">
 </div>
+</div>
+<div class="row">
+<div class="swatch" id="livePreview" role="img" aria-label="Live color and brightness preview"></div>
 </div>
 <div class="row">
 <div id="effectColorRow" style="display:none">
 <div class="label"><span id="effectColorLabel">Effect Color</span><span class="value" id="effectColorValue">#FFFFFF</span></div>
-<input id="effectColor" type="color" value="#ffffff">
+<input id="effectColor" type="color" value="#ffffff" aria-label="Effect color">
 </div>
 </div>
-<div class="effect-tabs">
-<button class="tab-btn active" data-effect-tab="solid">Solid</button>
-<button class="tab-btn" data-effect-tab="glow">Glow</button>
-<button class="tab-btn" data-effect-tab="rainbow">Rainbow</button>
-<button class="tab-btn" data-effect-tab="chase">Chase</button>
-<button class="tab-btn" data-effect-tab="sparkle">Sparkle</button>
-<button class="tab-btn" data-effect-tab="wave">Wave</button>
+<div class="effect-tabs" role="tablist" aria-label="LED effect">
+<button class="tab-btn active" data-effect-tab="solid" role="tab" aria-controls="effectParamPanel" aria-selected="true">Solid</button>
+<button class="tab-btn" data-effect-tab="glow" role="tab" aria-controls="effectParamPanel" aria-selected="false">Glow</button>
+<button class="tab-btn" data-effect-tab="rainbow" role="tab" aria-controls="effectParamPanel" aria-selected="false">Rainbow</button>
+<button class="tab-btn" data-effect-tab="chase" role="tab" aria-controls="effectParamPanel" aria-selected="false">Chase</button>
+<button class="tab-btn" data-effect-tab="sparkle" role="tab" aria-controls="effectParamPanel" aria-selected="false">Sparkle</button>
+<button class="tab-btn" data-effect-tab="wave" role="tab" aria-controls="effectParamPanel" aria-selected="false">Wave</button>
 </div>
-<div class="row">
+<div class="row" id="effectParamPanel" role="tabpanel" aria-label="Effect parameters">
 <div id="effectParamRow0">
 <div class="label"><span id="effectParamLabel0">Param 1</span><span class="value" id="effectParamValue0">0</span></div>
 <input id="effectParamInput0" type="range" min="0" max="255" step="1" value="0">
@@ -400,6 +451,26 @@ button:focus-visible,input:focus-visible,a:focus-visible{outline:3px solid var(-
 <div class="status" id="controlStatus" role="status" aria-live="polite"></div>
 <div class="footer">Applying control turns the strip on when brightness is above zero. Set brightness to zero to keep it dark.</div>
 </div>
+<div class="card">
+<h2>Sleep / Wake Timer</h2>
+<div class="row">
+<div>
+<div class="label"><span>Action</span><span class="value">One-shot</span></div>
+<select id="timerAction" aria-label="Timer action"><option value="0">Turn Off</option><option value="1">Turn On</option></select>
+</div>
+<div>
+<div class="label"><span>Minutes</span><span class="value">1-1440</span></div>
+<input id="timerMinutes" type="number" min="1" max="1440" value="30" aria-label="Timer minutes">
+</div>
+</div>
+<div class="actions">
+<button class="btn btn-primary" id="timerStartBtn">Start Timer</button>
+<button class="btn btn-secondary" id="timerCancelBtn">Cancel Timer</button>
+</div>
+<div class="countdown" id="timerCountdown" role="status" aria-live="polite">No timer set</div>
+<div class="status" id="timerStatus" role="status" aria-live="polite"></div>
+<div class="footer">A one-shot timer that toggles power only, keeping the saved color, brightness, and effect. It counts from device uptime and is cleared by a reboot. Works without internet time.</div>
+</div>
 </section>
 </div>
 <script>
@@ -425,6 +496,9 @@ const brightnessValue = document.getElementById('brightnessValue');
 const otaFile = document.getElementById('otaFile');
 const otaBtn = document.getElementById('otaBtn');
 const otaStatus = document.getElementById('otaStatus');
+const otaProgress = document.getElementById('otaProgress');
+const connBanner = document.getElementById('connBanner');
+const pageWrap = document.querySelector('.wrap');
 const overviewMatterStatus = document.getElementById('overviewMatterStatus');
 const overviewMatterEndpoint = document.getElementById('overviewMatterEndpoint');
 const overviewMatterFabricCount = document.getElementById('overviewMatterFabricCount');
@@ -458,6 +532,20 @@ const rebootBtn = document.getElementById('rebootBtn');
 const revertBtn = document.getElementById('revertBtn');
 const factoryResetBtn = document.getElementById('factoryResetBtn');
 const checkUpdateBtn = document.getElementById('checkUpdateBtn');
+const timerAction = document.getElementById('timerAction');
+const timerMinutes = document.getElementById('timerMinutes');
+const timerStartBtn = document.getElementById('timerStartBtn');
+const timerCancelBtn = document.getElementById('timerCancelBtn');
+const timerCountdown = document.getElementById('timerCountdown');
+const timerStatus = document.getElementById('timerStatus');
+const scheduleTz = document.getElementById('scheduleTz');
+const scheduleRows = document.getElementById('scheduleRows');
+const scheduleTimeLine = document.getElementById('scheduleTimeLine');
+const saveScheduleBtn = document.getElementById('saveScheduleBtn');
+const scheduleStatus = document.getElementById('scheduleStatus');
+const SCHED_COUNT = 8;
+const DAY_LABELS = ['Su','Mo','Tu','We','Th','Fr','Sa'];
+let scheduleRowEls = [];
 const effectTabButtons = Array.from(document.querySelectorAll('[data-effect-tab]'));
 const effectParamRows = [0,1,2,3,4].map((index)=>({row:document.getElementById('effectParamRow'+index),label:document.getElementById('effectParamLabel'+index),value:document.getElementById('effectParamValue'+index),input:document.getElementById('effectParamInput'+index)}));
 const EFFECT_META = {
@@ -471,7 +559,9 @@ wave:{params:[{label:'Wave Speed',min:1,max:255,defaultValue:110},{label:'Wavele
 let effectProfiles = {};
 let effectColors = {};
 let selectedEffect = 'solid';
-function switchMainTab(name){mainTabButtons.forEach((button)=>button.classList.toggle('active',button.dataset.mainTab===name));Object.entries(panels).forEach(([panelName,panel])=>panel.classList.toggle('active',panelName===name))}
+const livePreview = document.getElementById('livePreview');
+let otaInFlight = false;let liveApplyPending = false;let liveApplyTimer = null;
+function switchMainTab(name){mainTabButtons.forEach((button)=>{const on=button.dataset.mainTab===name;button.classList.toggle('active',on);button.setAttribute('aria-selected',on?'true':'false')});Object.entries(panels).forEach(([panelName,panel])=>panel.classList.toggle('active',panelName===name))}
 function buildDefaultEffectProfiles(){const profiles={};for(const [name,meta] of Object.entries(EFFECT_META)){profiles[name]=[0,0,0,0,0];meta.params.forEach((param,index)=>{profiles[name][index]=param.defaultValue})}return profiles}
 function buildDefaultEffectColors(){const colors={};for(const [name,meta] of Object.entries(EFFECT_META)){colors[name]=(meta.colors&&meta.colors[0]?meta.colors[0].defaultValue:'#FFFFFF').toUpperCase()}return colors}
 function normalizeEffectProfiles(rawProfiles){const profiles=buildDefaultEffectProfiles();for(const [name,values] of Object.entries(rawProfiles||{})){if(!profiles[name]||!Array.isArray(values))continue;values.forEach((value,index)=>{const meta=EFFECT_META[name].params[index];if(!meta)return;const parsed=Number(value);if(Number.isFinite(parsed)){profiles[name][index]=Math.max(meta.min,Math.min(meta.max,parsed))}})}return profiles}
@@ -480,43 +570,75 @@ function normalizeEffectColors(rawColors){const colors=buildDefaultEffectColors(
 function syncConfigCount(v){configCount.value=v;configCountNumber.value=v;configCountValue.textContent=v}
 function getSelectedEffectValues(){if(!effectProfiles[selectedEffect]){effectProfiles[selectedEffect]=buildDefaultEffectProfiles()[selectedEffect]||[0,0,0,0,0]}return effectProfiles[selectedEffect]}
 function getSelectedEffectColor(){if(!(selectedEffect in effectColors)){effectColors[selectedEffect]=buildDefaultEffectColors()[selectedEffect]||'#FFFFFF'}return effectColors[selectedEffect]}
-function renderEffectButtons(){effectTabButtons.forEach((button)=>button.classList.toggle('active',button.dataset.effectTab===selectedEffect))}
-function syncEffectControls(){const meta=EFFECT_META[selectedEffect]||EFFECT_META.solid;const values=getSelectedEffectValues();effectParamRows.forEach((slot,index)=>{const spec=meta.params[index];if(!spec){slot.row.style.display='none';return}slot.row.style.display='block';slot.label.textContent=spec.label;slot.input.min=spec.min;slot.input.max=spec.max;slot.input.value=values[index];slot.value.textContent=values[index]});const colorSpec=(meta.colors||[])[0];if(!colorSpec){effectColorRow.style.display='none'}else{effectColorRow.style.display='block';effectColorLabel.textContent=colorSpec.label;effectColor.value=getSelectedEffectColor().toLowerCase();effectColorValue.textContent=getSelectedEffectColor().toUpperCase()}renderEffectButtons()}
+function renderEffectButtons(){effectTabButtons.forEach((button)=>{const on=button.dataset.effectTab===selectedEffect;button.classList.toggle('active',on);button.setAttribute('aria-selected',on?'true':'false')})}
+function syncEffectControls(){const meta=EFFECT_META[selectedEffect]||EFFECT_META.solid;const values=getSelectedEffectValues();effectParamRows.forEach((slot,index)=>{const spec=meta.params[index];if(!spec){slot.row.style.display='none';return}slot.row.style.display='block';slot.label.textContent=spec.label;slot.input.setAttribute('aria-label',spec.label);slot.input.min=spec.min;slot.input.max=spec.max;slot.input.value=values[index];slot.value.textContent=values[index]});const colorSpec=(meta.colors||[])[0];if(!colorSpec){effectColorRow.style.display='none'}else{effectColorRow.style.display='block';effectColorLabel.textContent=colorSpec.label;effectColor.setAttribute('aria-label',colorSpec.label);effectColor.value=getSelectedEffectColor().toLowerCase();effectColorValue.textContent=getSelectedEffectColor().toUpperCase()}renderEffectButtons()}
 function stashEffectControls(){const meta=EFFECT_META[selectedEffect]||EFFECT_META.solid;const values=getSelectedEffectValues();effectParamRows.forEach((slot,index)=>{if(!meta.params[index]){values[index]=0;return}values[index]=Number(slot.input.value);slot.value.textContent=slot.input.value});if((meta.colors||[])[0]){effectColors[selectedEffect]=normalizeHexColor(effectColor.value,getSelectedEffectColor())}}
-function updateControlReadout(){brightnessValue.textContent=controlBrightness.value;controlColorValue.textContent=controlColor.value.toUpperCase();if(effectColorRow.style.display!=='none'){effectColorValue.textContent=effectColor.value.toUpperCase()}}
-function setLink(linkEl,url,emptyLabel){if(url){linkEl.href=url;linkEl.textContent=url}else{linkEl.href='#';linkEl.textContent=emptyLabel||'Unavailable'}}
-function refreshOverview(data){const admin=data.softap_admin!==false;const windowOpen=!!data.matter_window_open;overviewMatterStatus.textContent=data.commissioned?'Commissioned':'Ready to pair';overviewMatterEndpoint.textContent=data.matter_endpoint;overviewMatterFabricCount.textContent=(data.matter_fabric_count??'-');overviewMatterWindow.textContent=windowOpen?'Open':'Closed';openMatterWindowBtn.disabled=!admin||!data.matter_ready||!!data.commissioned||windowOpen;openMatterWindowBtn.textContent=windowOpen?'Pairing Window Open':(data.commissioned?'Pairing Managed by Matter':'Open 5-Minute Pairing Window');matterPairingStatus.textContent=!admin?'Connect to the device SoftAP to open pairing.':!data.matter_ready?'Matter stack is not ready.':windowOpen?'Open for 5 minutes.':data.commissioned?'Closed; use an existing Matter administrator to add a controller.':'Closed; press the button to open it.';overviewManualCode.textContent=data.manual_code||'Unavailable';setLink(overviewQrLink,data.qr_url,'Unavailable');overviewApSsid.textContent=data.ap_ssid||'-';setLink(overviewApUrl,data.ap_url||(data.ap_ip?('http://'+data.ap_ip):''),'Unavailable');overviewStaStatus.textContent=data.sta_connected?'Connected':'Not connected';overviewStaSsid.textContent=data.sta_ssid||'-';overviewStaBssid.textContent=(data.sta_bssid||'-')+(data.sta_channel?(' / ch '+data.sta_channel):'');overviewStaRssi.textContent=(data.sta_rssi||data.sta_rssi===0)?(data.sta_rssi+' dBm'):'-';overviewStaReason.textContent=(data.sta_last_disconnect_reason&&data.sta_last_disconnect_reason!==0)?((data.sta_last_disconnect_reason_text||'unknown')+' ('+String(data.sta_last_disconnect_reason)+')'):'None';setLink(overviewLanUrl,data.lan_url||(data.sta_ip?('http://'+data.sta_ip):''),'Not connected');overviewApRestart.textContent=data.ap_restart_required?'Yes, reset to apply new AP config':'No';overviewFwVersion.textContent=data.fw_version||'unknown';overviewRunningPartition.textContent=data.running_partition||'-';overviewNextPartition.textContent=data.ota_target_partition||'-';overviewRevertTarget.textContent=data.revert_available?((data.revert_version||'unknown')+' @ '+(data.revert_partition||'')):'No previous firmware available';overviewPublishedVersion.textContent=data.auto_update_latest_version||'Unknown';overviewUpdateStatus.textContent=data.auto_update_status||'Idle'}
-function refreshFirmwarePanel(data){const cur=data.fw_version||'unknown';const avail=data.auto_update_latest_version||'';const admin=data.softap_admin!==false;firmwareCurrentVersion.textContent=cur;firmwareAvailableVersion.textContent=avail?avail:'No update available';const canInstall=!!data.auto_update_available && !data.auto_update_busy && avail && avail!==cur;installUpdateBtn.disabled=!admin||!canInstall;installUpdateBtn.textContent=data.auto_update_busy?'Installing...':(canInstall?('Install Update '+avail):'Install Update');updateStatusLine.textContent=data.auto_update_status||'Idle'}
+function updateLivePreview(){const scale=Number(controlBrightness.value)/255;livePreview.style.background=controlColor.value;livePreview.style.filter='brightness('+Math.max(0.12,scale).toFixed(3)+')'}
+function updateControlReadout(){brightnessValue.textContent=controlBrightness.value;controlColorValue.textContent=controlColor.value.toUpperCase();if(effectColorRow.style.display!=='none'){effectColorValue.textContent=effectColor.value.toUpperCase()}updateLivePreview()}
+function buildControlPayload(){const brightness=Number(controlBrightness.value);const payload={brightness:brightness,color:controlColor.value,effect:selectedEffect,effect_params:getSelectedEffectValues(),power:brightness>0};if((EFFECT_META[selectedEffect].colors||[])[0]){payload.effect_color=getSelectedEffectColor()}return payload}
+function scheduleLiveApply(){if(otaInFlight)return;liveApplyPending=true;if(liveApplyTimer)clearTimeout(liveApplyTimer);liveApplyTimer=setTimeout(liveApply,150)}
+async function liveApply(){liveApplyTimer=null;if(otaInFlight){liveApplyPending=false;return}stashEffectControls();const payload=buildControlPayload();try{const res=await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(res.ok){await res.json().catch(()=>{})}}catch(_){}finally{if(!liveApplyTimer)liveApplyPending=false;updateControlReadout()}}
+function reconcileControls(data){if(liveApplyPending||otaInFlight)return;const active=document.activeElement;const busy=[controlBrightness,controlColor,effectColor].concat(effectParamRows.map((slot)=>slot.input)).concat(effectTabButtons);if(busy.indexOf(active)!==-1)return;effectProfiles=normalizeEffectProfiles(data.effect_profiles);effectColors=normalizeEffectColors(data.effect_colors);selectedEffect=data.effect||selectedEffect;controlBrightness.value=data.brightness;controlColor.value=data.color||controlColor.value;syncEffectControls();updateControlReadout()}
+function setLink(linkEl,url,emptyLabel){if(url){linkEl.setAttribute('href',url);linkEl.removeAttribute('aria-disabled');linkEl.textContent=url}else{linkEl.removeAttribute('href');linkEl.setAttribute('aria-disabled','true');linkEl.textContent=emptyLabel||'Unavailable'}}
+function stampUserMsg(el,msg){el.dataset.userTs=String(Date.now());el.textContent=msg}
+function userMsgRecent(el){const t=Number(el.dataset.userTs||0);return t>0&&(Date.now()-t)<8000}
+let timerActive=false;let timerActionVal=0;let timerRemaining=0;let timerTick=null;
+function pad2(n){return String(n).padStart(2,'0')}
+function fmtDuration(s){s=Math.max(0,Math.floor(s));const h=Math.floor(s/3600);const m=Math.floor((s%3600)/60);const sec=s%60;return h>0?(h+':'+pad2(m)+':'+pad2(sec)):(m+':'+pad2(sec))}
+function renderCountdown(){if(!timerActive){timerCountdown.textContent='No timer set';return}timerCountdown.textContent=(timerActionVal===1?'Turns on in ':'Turns off in ')+fmtDuration(timerRemaining)}
+function syncTimer(active,action,remaining){timerActive=!!active;timerActionVal=Number(action)||0;timerRemaining=Math.max(0,Number(remaining)||0);renderCountdown()}
+function timerLocalTick(){if(!timerActive)return;if(timerRemaining>0){timerRemaining--;if(timerRemaining<=0){timerActive=false}renderCountdown()}}
+async function startTimer(){const mins=Math.max(1,Math.min(1440,Math.floor(Number(timerMinutes.value)||0)));const action=Number(timerAction.value)===1?1:0;timerStatus.textContent='Starting timer...';const res=await fetch('/api/timer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action,minutes:mins})});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok)throw new Error(data.message||text||'Failed to start timer');timerStatus.textContent=data.message||'Timer started';syncTimer(true,action,mins*60);pollStatus()}
+async function cancelTimer(){timerStatus.textContent='Cancelling timer...';const res=await fetch('/api/timer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:0,minutes:0})});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok)throw new Error(data.message||text||'Failed to cancel timer');timerStatus.textContent=data.message||'Timer cancelled';syncTimer(false,0,0);pollStatus()}
+function buildScheduleRows(){scheduleRowEls=[];scheduleRows.innerHTML='';for(let i=0;i<SCHED_COUNT;i++){const row=document.createElement('div');row.className='sched-row';const en=document.createElement('input');en.type='checkbox';en.setAttribute('aria-label','Schedule '+(i+1)+' enabled');const time=document.createElement('input');time.type='time';time.value='00:00';time.setAttribute('aria-label','Schedule '+(i+1)+' time');const days=document.createElement('div');days.className='sched-days';const dayInputs=[];for(let d=0;d<7;d++){const lab=document.createElement('label');const cb=document.createElement('input');cb.type='checkbox';cb.setAttribute('aria-label','Schedule '+(i+1)+' '+DAY_LABELS[d]);const span=document.createElement('span');span.textContent=DAY_LABELS[d];lab.appendChild(cb);lab.appendChild(span);days.appendChild(lab);dayInputs.push(cb)}const act=document.createElement('select');act.setAttribute('aria-label','Schedule '+(i+1)+' action');const optOn=document.createElement('option');optOn.value='1';optOn.textContent='On';const optOff=document.createElement('option');optOff.value='0';optOff.textContent='Off';act.appendChild(optOn);act.appendChild(optOff);row.appendChild(en);row.appendChild(time);row.appendChild(days);row.appendChild(act);scheduleRows.appendChild(row);scheduleRowEls.push({enabled:en,time:time,days:dayInputs,action:act})}}
+function fillScheduleRow(slot,entry){slot.enabled.checked=Number(entry.enabled)?true:false;const h=Math.max(0,Math.min(23,Number(entry.hour)||0));const m=Math.max(0,Math.min(59,Number(entry.minute)||0));slot.time.value=pad2(h)+':'+pad2(m);const mask=Number(entry.days)||0;slot.days.forEach((cb,d)=>{cb.checked=(mask&(1<<d))!==0});slot.action.value=Number(entry.action)===1?'1':'0'}
+function readScheduleRow(slot){const parts=(slot.time.value||'00:00').split(':');const h=Math.max(0,Math.min(23,parseInt(parts[0],10)||0));const m=Math.max(0,Math.min(59,parseInt(parts[1],10)||0));let mask=0;slot.days.forEach((cb,d)=>{if(cb.checked)mask|=(1<<d)});return{enabled:slot.enabled.checked?1:0,hour:h,minute:m,days:mask,action:Number(slot.action.value)===1?1:0}}
+function updateScheduleTimeLine(timeValid,nowLocal){if(timeValid){scheduleTimeLine.textContent='Device time: '+(nowLocal||'-')}else{scheduleTimeLine.textContent='Clock not synced yet (schedules need internet).'}}
+function applyScheduleConfig(data){if(!scheduleRowEls.length)buildScheduleRows();if(typeof data.tz==='string')scheduleTz.value=data.tz;const list=Array.isArray(data.schedules)?data.schedules:[];for(let i=0;i<SCHED_COUNT;i++){fillScheduleRow(scheduleRowEls[i],list[i]||{})}updateScheduleTimeLine(!!data.time_valid,data.now_local);if(data.relative)syncTimer(data.relative.active,data.relative.action,data.relative.remaining_s)}
+async function loadSchedule(){const res=await fetch('/api/schedule',{cache:'no-store'});if(!res.ok)throw new Error('Failed to load schedules');const data=await res.json();applyScheduleConfig(data);return data}
+async function saveSchedule(){scheduleStatus.textContent='Saving schedules...';const schedules=scheduleRowEls.map(readScheduleRow);const payload={tz:scheduleTz.value.trim(),schedules:schedules};const res=await fetch('/api/schedule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const text=await res.text();if(!res.ok)throw new Error(text||'Failed to save schedules');let data={};try{data=JSON.parse(text)}catch(_){ }applyScheduleConfig(data);scheduleStatus.textContent='Schedules saved'}
+function refreshOverview(data){const admin=data.softap_admin!==false;const windowOpen=!!data.matter_window_open;overviewMatterStatus.textContent=data.commissioned?'Commissioned':'Ready to pair';overviewMatterEndpoint.textContent=data.matter_endpoint;overviewMatterFabricCount.textContent=(data.matter_fabric_count??'-');overviewMatterWindow.textContent=windowOpen?'Open':'Closed';openMatterWindowBtn.disabled=!admin||!data.matter_ready||!!data.commissioned||windowOpen;openMatterWindowBtn.textContent=windowOpen?'Pairing Window Open':(data.commissioned?'Pairing Managed by Matter':'Open 5-Minute Pairing Window');if(!userMsgRecent(matterPairingStatus)){matterPairingStatus.textContent=!admin?'Connect to the device SoftAP to open pairing.':!data.matter_ready?'Matter stack is not ready.':windowOpen?'Open for 5 minutes.':data.commissioned?'Closed; use an existing Matter administrator to add a controller.':'Closed; press the button to open it.'}overviewManualCode.textContent=data.manual_code||'Unavailable';setLink(overviewQrLink,data.qr_url,'Unavailable');overviewApSsid.textContent=data.ap_ssid||'-';setLink(overviewApUrl,data.ap_url||(data.ap_ip?('http://'+data.ap_ip):''),'Unavailable');overviewStaStatus.textContent=data.sta_connected?'Connected':'Not connected';overviewStaSsid.textContent=data.sta_ssid||'-';overviewStaBssid.textContent=(data.sta_bssid||'-')+(data.sta_channel?(' / ch '+data.sta_channel):'');overviewStaRssi.textContent=(data.sta_rssi||data.sta_rssi===0)?(data.sta_rssi+' dBm'):'-';overviewStaReason.textContent=(data.sta_last_disconnect_reason&&data.sta_last_disconnect_reason!==0)?((data.sta_last_disconnect_reason_text||'unknown')+' ('+String(data.sta_last_disconnect_reason)+')'):'None';setLink(overviewLanUrl,data.lan_url||(data.sta_ip?('http://'+data.sta_ip):''),'Not connected');overviewApRestart.textContent=data.ap_restart_required?'Yes, reboot to apply new AP config':'No';overviewFwVersion.textContent=data.fw_version||'unknown';overviewRunningPartition.textContent=data.running_partition||'-';overviewNextPartition.textContent=data.ota_target_partition||'-';overviewRevertTarget.textContent=data.revert_available?((data.revert_version||'unknown')+' @ '+(data.revert_partition||'')):'No previous firmware available';overviewPublishedVersion.textContent=data.auto_update_latest_version||'Unknown';overviewUpdateStatus.textContent=data.auto_update_status||'Idle'}
+function refreshFirmwarePanel(data){const cur=data.fw_version||'unknown';const avail=data.auto_update_latest_version||'';const admin=data.softap_admin!==false;firmwareCurrentVersion.textContent=cur;firmwareAvailableVersion.textContent=avail?avail:'No update available';const canInstall=!!data.auto_update_available && !data.auto_update_busy && avail && avail!==cur;installUpdateBtn.disabled=!admin||!canInstall;installUpdateBtn.textContent=data.auto_update_busy?'Installing...':(canInstall?('Install Update '+avail):'Install Update');if(!userMsgRecent(updateStatusLine)){updateStatusLine.textContent=data.auto_update_status||'Idle'}}
 function setOtaBusy(busy){otaBtn.disabled=busy;otaFile.disabled=busy;otaBtn.textContent=busy?'Uploading OTA...':'Install From File'}
-function applyStateToUi(data){const admin=data.softap_admin!==false;effectProfiles=normalizeEffectProfiles(data.effect_profiles);effectColors=normalizeEffectColors(data.effect_colors);selectedEffect=data.effect||'solid';syncConfigCount(data.count);configCount.max=data.max_leds;configCountNumber.max=data.max_leds;configApSsid.value=data.config_ap_ssid||data.ap_ssid||'';configApPassword.value='';if(typeof data.auto_install_enabled==='boolean'){configAutoInstall.checked=data.auto_install_enabled}controlBrightness.value=data.brightness;controlColor.value=data.color||controlColor.value;const adminControls=[configCount,configCountNumber,configApSsid,configApPassword,configAutoInstall,saveConfigBtn,rebootBtn,otaBtn,otaFile,checkUpdateBtn,openMatterWindowBtn,factoryResetBtn];adminControls.forEach((element)=>{element.disabled=!admin});revertBtn.disabled=!admin||!data.revert_available;refreshOverview(data);refreshFirmwarePanel(data);otaStatus.textContent=admin?'Next OTA slot: '+(data.ota_target_partition||'unknown')+'. Upload build/esp32c6_led_web.bin after the first USB flash.':'Connect to the device SoftAP to administer firmware and configuration.';syncEffectControls();updateControlReadout()}
-async function loadState(){controlStatus.textContent='Loading device state...';const res=await fetch('/api/state');if(!res.ok)throw new Error('Failed to load state');const data=await res.json();applyStateToUi(data);controlStatus.textContent='Device state loaded';configStatus.textContent=data.ap_restart_required?'Saved AP config is waiting for a reset.':'Configuration loaded'}
-async function pollStatus(){if(document.hidden)return;try{const res=await fetch('/api/state',{cache:'no-store'});if(!res.ok)return;const data=await res.json();refreshOverview(data);refreshFirmwarePanel(data)}catch(_){}}
-async function saveControl(){controlStatus.textContent='Applying control...';stashEffectControls();const brightness=Number(controlBrightness.value);const payload={brightness:brightness,color:controlColor.value,effect:selectedEffect,effect_params:getSelectedEffectValues(),power:brightness>0};if((EFFECT_META[selectedEffect].colors||[])[0]){payload.effect_color=getSelectedEffectColor()}const res=await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!res.ok)throw new Error(await res.text()||'Failed to apply control');const data=await res.json();applyStateToUi(data);controlStatus.textContent='Control saved'}
+function setScheduleEditorDisabled(disabled){scheduleTz.disabled=disabled;saveScheduleBtn.disabled=disabled;scheduleRowEls.forEach((slot)=>{slot.enabled.disabled=disabled;slot.time.disabled=disabled;slot.action.disabled=disabled;slot.days.forEach((cb)=>{cb.disabled=disabled})})}
+function applyAdminGating(data){const admin=data.softap_admin!==false;const adminControls=[configCount,configCountNumber,configApSsid,configApPassword,configAutoInstall,saveConfigBtn,rebootBtn,otaBtn,otaFile,checkUpdateBtn,openMatterWindowBtn,factoryResetBtn];adminControls.forEach((element)=>{element.disabled=!admin});revertBtn.disabled=!admin||!data.revert_available;setScheduleEditorDisabled(!admin)}
+function applyStateToUi(data){const admin=data.softap_admin!==false;effectProfiles=normalizeEffectProfiles(data.effect_profiles);effectColors=normalizeEffectColors(data.effect_colors);selectedEffect=data.effect||'solid';syncConfigCount(data.count);configCount.max=data.max_leds;configCountNumber.max=data.max_leds;configApSsid.value=data.config_ap_ssid||data.ap_ssid||'';configApPassword.value='';if(typeof data.auto_install_enabled==='boolean'){configAutoInstall.checked=data.auto_install_enabled}controlBrightness.value=data.brightness;controlColor.value=data.color||controlColor.value;applyAdminGating(data);refreshOverview(data);refreshFirmwarePanel(data);otaStatus.textContent=admin?'Next OTA slot: '+(data.ota_target_partition||'unknown')+'. Upload build/esp32c6_led_web.bin after the first USB flash.':'Connect to the device SoftAP to administer firmware and configuration.';syncEffectControls();updateControlReadout();syncTimer(data.relative_active,data.relative_action,data.relative_remaining_s)}
+async function loadState(){controlStatus.textContent='Loading device state...';const res=await fetch('/api/state');if(!res.ok)throw new Error('Failed to load state');const data=await res.json();applyStateToUi(data);loadSchedule().catch(err=>scheduleStatus.textContent=err.message);controlStatus.textContent='Device state loaded';configStatus.textContent=data.ap_restart_required?'Saved AP config is waiting for a reboot.':'Configuration loaded'}
+let connMisses=0;let connDown=false;
+function showConnDown(msg){if(connDown&&connBanner.textContent===msg)return;connBanner.textContent=msg;connBanner.hidden=false;pageWrap.classList.add('stale');connDown=true}
+function clearConnDown(){if(!connDown)return;connBanner.hidden=true;pageWrap.classList.remove('stale');connDown=false}
+function recoverAfterReboot(){otaInFlight=true;connDown=true;connBanner.textContent='Device is restarting - reconnecting...';connBanner.hidden=false;pageWrap.classList.add('stale');const start=Date.now();const retry=()=>{if(Date.now()-start>90000){connBanner.textContent='Device still unreachable - reload manually.'}else{setTimeout(tick,2000)}};function tick(){fetch('/api/state',{cache:'no-store'}).then((res)=>{if(res.ok){window.location.reload()}else{retry()}}).catch(retry)}setTimeout(tick,2000)}
+async function pollStatus(){if(document.hidden)return;try{const res=await fetch('/api/state',{cache:'no-store'});if(!res.ok)throw new Error('poll status '+res.status);const data=await res.json();connMisses=0;if(!otaInFlight)clearConnDown();applyAdminGating(data);refreshOverview(data);refreshFirmwarePanel(data);reconcileControls(data);syncTimer(data.relative_active,data.relative_action,data.relative_remaining_s);updateScheduleTimeLine(!!data.time_valid,data.now_local)}catch(_){if(otaInFlight)return;connMisses++;if(connMisses>=2)showConnDown('Device unreachable - reconnecting...')}}
+async function saveControl(){controlStatus.textContent='Applying control...';if(liveApplyTimer){clearTimeout(liveApplyTimer);liveApplyTimer=null}liveApplyPending=false;stashEffectControls();const payload=buildControlPayload();const res=await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!res.ok)throw new Error(await res.text()||'Failed to apply control');const data=await res.json();applyStateToUi(data);controlStatus.textContent='Control saved'}
 async function saveConfig(){configStatus.textContent='Saving configuration...';const payload={count:Number(configCount.value),ap_ssid:configApSsid.value.trim(),ap_password:configApPassword.value,auto_install_enabled:!!configAutoInstall.checked};const res=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!res.ok)throw new Error(await res.text()||'Failed to save configuration');const data=await res.json();applyStateToUi(data);configStatus.textContent=data.ap_restart_required?'Configuration saved. Press Reboot to apply the new AP credentials.':'Configuration saved'}
-async function openMatterPairingWindow(){matterPairingStatus.textContent='Opening Matter pairing window...';openMatterWindowBtn.disabled=true;const res=await fetch('/api/matter/pairing-window',{method:'POST'});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok)throw new Error(data.message||text||'Failed to open Matter pairing window');matterPairingStatus.textContent=data.message||'Matter pairing window opened';setTimeout(()=>loadState().catch(err=>matterPairingStatus.textContent=err.message),500)}
-async function uploadOta(){const file=otaFile.files&&otaFile.files[0];if(!file)throw new Error('Choose a firmware .bin file first');setOtaBusy(true);otaStatus.textContent='Uploading '+file.name+' ('+file.size+' bytes)...';const res=await fetch('/api/ota',{method:'POST',headers:{'Content-Type':'application/octet-stream','X-Filename':file.name},body:file});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok)throw new Error(data.message||text||'OTA update failed');otaStatus.textContent=data.message||'Update installed. Device will restart.';actionStatus.textContent='OTA accepted. Reconnect after reboot.';setTimeout(()=>window.location.reload(),12000)}
-async function postAction(url,statusEl,confirmText){if(confirmText&&!window.confirm(confirmText))return;statusEl.textContent='Sending command...';const res=await fetch(url,{method:'POST'});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok)throw new Error(data.message||text||'Action failed');statusEl.textContent=data.message||'Command sent';setTimeout(()=>window.location.reload(),12000)}
-async function checkPublishedUpdate(){updateStatusLine.textContent='Checking GitHub for the latest release...';const res=await fetch('/api/check-update',{method:'POST'});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok)throw new Error(data.message||text||'Published update check failed');updateStatusLine.textContent=data.message||'Check queued';setTimeout(()=>loadState().catch(err=>updateStatusLine.textContent=err.message),3000)}
-async function installPublishedUpdate(){if(!window.confirm('Install the latest published firmware now? The device will reboot.'))return;updateStatusLine.textContent='Queueing install...';installUpdateBtn.disabled=true;const res=await fetch('/api/install-update',{method:'POST'});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok){installUpdateBtn.disabled=false;throw new Error(data.message||text||'Install failed')}updateStatusLine.textContent=data.message||'Install queued';setTimeout(()=>loadState().catch(err=>updateStatusLine.textContent=err.message),3000)}
+async function openMatterPairingWindow(){stampUserMsg(matterPairingStatus,'Opening Matter pairing window...');openMatterWindowBtn.disabled=true;const res=await fetch('/api/matter/pairing-window',{method:'POST'});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok)throw new Error(data.message||text||'Failed to open Matter pairing window');stampUserMsg(matterPairingStatus,data.message||'Matter pairing window opened');setTimeout(()=>loadState().catch(err=>stampUserMsg(matterPairingStatus,err.message)),500)}
+function uploadOta(){const file=otaFile.files&&otaFile.files[0];if(!file)return Promise.reject(new Error('Choose a firmware .bin file first'));otaInFlight=true;setOtaBusy(true);otaStatus.textContent='Uploading '+file.name+' ('+file.size+' bytes)...';otaProgress.value=0;otaProgress.hidden=false;return new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();xhr.open('POST','/api/ota');xhr.setRequestHeader('Content-Type','application/octet-stream');xhr.setRequestHeader('X-Filename',file.name);xhr.upload.onprogress=(e)=>{if(e.lengthComputable){otaProgress.value=Math.round(e.loaded/e.total*100)}};xhr.onload=()=>{otaProgress.value=100;otaProgress.hidden=true;const text=xhr.responseText||'';let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(xhr.status<200||xhr.status>=300){otaInFlight=false;reject(new Error(data.message||text||'OTA update failed'));return}otaStatus.textContent=data.message||'Update installed. Device will restart.';actionStatus.textContent='OTA accepted. Reconnect after reboot.';recoverAfterReboot();resolve()};xhr.onerror=()=>{otaProgress.hidden=true;otaInFlight=false;reject(new Error('OTA update failed'))};xhr.send(file)})}
+async function postAction(url,statusEl,confirmText){if(confirmText&&!window.confirm(confirmText))return;otaInFlight=true;statusEl.textContent='Sending command...';const res=await fetch(url,{method:'POST'});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok){otaInFlight=false;throw new Error(data.message||text||'Action failed')}statusEl.textContent=data.message||'Command sent';recoverAfterReboot()}
+async function checkPublishedUpdate(){stampUserMsg(updateStatusLine,'Checking GitHub for the latest release...');const res=await fetch('/api/check-update',{method:'POST'});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok)throw new Error(data.message||text||'Published update check failed');stampUserMsg(updateStatusLine,data.message||'Check queued');setTimeout(()=>loadState().catch(err=>stampUserMsg(updateStatusLine,err.message)),3000)}
+async function installPublishedUpdate(){if(!window.confirm('Install the latest published firmware now? The device will reboot.'))return;stampUserMsg(updateStatusLine,'Queueing install...');otaInFlight=true;installUpdateBtn.disabled=true;const res=await fetch('/api/install-update',{method:'POST'});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok){installUpdateBtn.disabled=false;throw new Error(data.message||text||'Install failed')}stampUserMsg(updateStatusLine,data.message||'Install queued');setTimeout(()=>loadState().catch(err=>stampUserMsg(updateStatusLine,err.message)),3000)}
 mainTabButtons.forEach((button)=>button.addEventListener('click',()=>switchMainTab(button.dataset.mainTab)));
 configCount.addEventListener('input',()=>syncConfigCount(configCount.value));
 configCountNumber.addEventListener('input',()=>{const max=Number(configCount.max);let v=Number(configCountNumber.value||1);v=Math.max(1,Math.min(max,v));syncConfigCount(v)});
-controlBrightness.addEventListener('input',updateControlReadout);controlColor.addEventListener('input',updateControlReadout);
-effectTabButtons.forEach((button)=>button.addEventListener('click',()=>{stashEffectControls();selectedEffect=button.dataset.effectTab;syncEffectControls();updateControlReadout()}));
-effectParamRows.forEach((slot)=>slot.input.addEventListener('input',()=>{stashEffectControls();updateControlReadout()}));
-effectColor.addEventListener('input',()=>{effectColors[selectedEffect]=normalizeHexColor(effectColor.value,getSelectedEffectColor());updateControlReadout()});
+controlBrightness.addEventListener('input',()=>{updateControlReadout();scheduleLiveApply()});controlColor.addEventListener('input',()=>{updateControlReadout();scheduleLiveApply()});
+effectTabButtons.forEach((button)=>button.addEventListener('click',()=>{stashEffectControls();selectedEffect=button.dataset.effectTab;syncEffectControls();updateControlReadout();scheduleLiveApply()}));
+effectParamRows.forEach((slot)=>slot.input.addEventListener('input',()=>{stashEffectControls();updateControlReadout();scheduleLiveApply()}));
+effectColor.addEventListener('input',()=>{effectColors[selectedEffect]=normalizeHexColor(effectColor.value,getSelectedEffectColor());updateControlReadout();scheduleLiveApply()});
 saveControlBtn.addEventListener('click',()=>saveControl().catch(err=>controlStatus.textContent=err.message));
 saveConfigBtn.addEventListener('click',()=>saveConfig().catch(err=>configStatus.textContent=err.message));
+timerStartBtn.addEventListener('click',()=>startTimer().catch(err=>timerStatus.textContent=err.message));
+timerCancelBtn.addEventListener('click',()=>cancelTimer().catch(err=>timerStatus.textContent=err.message));
+saveScheduleBtn.addEventListener('click',()=>saveSchedule().catch(err=>scheduleStatus.textContent=err.message));
+setInterval(timerLocalTick,1000);
 document.getElementById('reloadBtn').addEventListener('click',()=>loadState().catch(err=>controlStatus.textContent=err.message));
 otaBtn.addEventListener('click',()=>uploadOta().catch(err=>{otaStatus.textContent=err.message;setOtaBusy(false)}));
-checkUpdateBtn.addEventListener('click',()=>checkPublishedUpdate().catch(err=>updateStatusLine.textContent=err.message));
-installUpdateBtn.addEventListener('click',()=>installPublishedUpdate().catch(err=>updateStatusLine.textContent=err.message));
-openMatterWindowBtn.addEventListener('click',()=>openMatterPairingWindow().catch(err=>{matterPairingStatus.textContent=err.message;openMatterWindowBtn.disabled=false;loadState().catch(()=>{})}));
+checkUpdateBtn.addEventListener('click',()=>checkPublishedUpdate().catch(err=>stampUserMsg(updateStatusLine,err.message)));
+installUpdateBtn.addEventListener('click',()=>installPublishedUpdate().catch(err=>stampUserMsg(updateStatusLine,err.message)));
+openMatterWindowBtn.addEventListener('click',()=>openMatterPairingWindow().catch(err=>{stampUserMsg(matterPairingStatus,err.message);openMatterWindowBtn.disabled=false}));
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)pollStatus()});setInterval(pollStatus,5000);
 rebootBtn.addEventListener('click',()=>postAction('/api/reboot',configStatus,'Reboot the device now?').catch(err=>configStatus.textContent=err.message));
 revertBtn.addEventListener('click',()=>postAction('/api/revert',actionStatus,'Revert to the previous firmware slot and reboot?').catch(err=>actionStatus.textContent=err.message));
 factoryResetBtn.addEventListener('click',()=>postAction('/api/factory-reset',actionStatus,'Factory reset will erase Matter pairing, Wi-Fi AP config, and saved LED settings. Continue?').catch(err=>actionStatus.textContent=err.message));
-effectProfiles=buildDefaultEffectProfiles();effectColors=buildDefaultEffectColors();syncEffectControls();loadState().catch(err=>{controlStatus.textContent=err.message;configStatus.textContent=err.message;updateControlReadout()});
+effectProfiles=buildDefaultEffectProfiles();effectColors=buildDefaultEffectColors();syncEffectControls();buildScheduleRows();loadState().catch(err=>{controlStatus.textContent=err.message;configStatus.textContent=err.message;updateControlReadout()});
 </script>
 </body>
 </html>
@@ -1106,6 +1228,10 @@ static esp_err_t fetch_latest_published_update(published_update_info_t *info)
 #define APP_OTA_HEALTH_KEY_SLOT    "slot"
 #define APP_OTA_HEALTH_KEY_VER     "ver"
 #define APP_OTA_HEALTH_KEY_STRIKES "strikes"
+// manual=1 marks an image installed via the "Install From File" upload. Manual
+// images self-test on Matter readiness alone (no STA required) so a bench-flash
+// on a device that never joins home Wi-Fi is not rolled back. Absent key => 0.
+#define APP_OTA_HEALTH_KEY_MANUAL  "manual"
 #define APP_OTA_MAX_STRIKES        2
 
 static esp_err_t ota_health_clear()
@@ -1124,7 +1250,10 @@ static esp_err_t ota_health_clear()
     return ESP_OK;
 }
 
-static esp_err_t ota_health_read(char *slot, size_t slot_len, char *ver, size_t ver_len, uint8_t *strikes)
+// `manual` (optional out-param, may be nullptr) reports whether the marker was
+// written by a manual "Install From File" upload.
+static esp_err_t ota_health_read(char *slot, size_t slot_len, char *ver, size_t ver_len, uint8_t *strikes,
+                                 bool *manual)
 {
     nvs_handle_t h = 0;
     esp_err_t err = nvs_open(APP_OTA_HEALTH_NS, NVS_READONLY, &h);
@@ -1136,6 +1265,7 @@ static esp_err_t ota_health_read(char *slot, size_t slot_len, char *ver, size_t 
     if (slot && slot_len) slot[0] = '\0';
     if (ver && ver_len)  ver[0] = '\0';
     if (strikes) *strikes = 0;
+    if (manual) *manual = false;
 
     err = nvs_get_str(h, APP_OTA_HEALTH_KEY_SLOT, slot, &s_len);
     if (err != ESP_OK) { nvs_close(h); return err; }
@@ -1150,11 +1280,18 @@ static esp_err_t ota_health_read(char *slot, size_t slot_len, char *ver, size_t 
         }
         *strikes = v;
     }
+    if (manual) {
+        // Absent for published OTA and for pre-existing markers; treat as false.
+        uint8_t v = 0;
+        if (nvs_get_u8(h, APP_OTA_HEALTH_KEY_MANUAL, &v) == ESP_OK) {
+            *manual = v != 0;
+        }
+    }
     nvs_close(h);
     return ESP_OK;
 }
 
-static esp_err_t ota_health_write(const char *slot, const char *ver, uint8_t strikes)
+static esp_err_t ota_health_write(const char *slot, const char *ver, uint8_t strikes, bool manual)
 {
     nvs_handle_t h = 0;
     esp_err_t err = nvs_open(APP_OTA_HEALTH_NS, NVS_READWRITE, &h);
@@ -1164,6 +1301,7 @@ static esp_err_t ota_health_write(const char *slot, const char *ver, uint8_t str
     nvs_set_str(h, APP_OTA_HEALTH_KEY_SLOT, slot ? slot : "");
     nvs_set_str(h, APP_OTA_HEALTH_KEY_VER, ver ? ver : "");
     nvs_set_u8(h, APP_OTA_HEALTH_KEY_STRIKES, strikes);
+    nvs_set_u8(h, APP_OTA_HEALTH_KEY_MANUAL, manual ? 1 : 0);
     err = nvs_commit(h);
     nvs_close(h);
     return err;
@@ -1184,8 +1322,9 @@ static void init_ota_probation()
     char marker_slot[16] = "";
     char marker_ver[APP_AUTO_UPDATE_VERSION_MAX] = "";
     uint8_t strikes = 0;
+    bool marker_manual = false;
     esp_err_t err = ota_health_read(marker_slot, sizeof(marker_slot),
-                                    marker_ver, sizeof(marker_ver), &strikes);
+                                    marker_ver, sizeof(marker_ver), &strikes, &marker_manual);
     if (err == ESP_ERR_NVS_NOT_FOUND || marker_slot[0] == '\0') {
         // No probation in progress — nothing to do. If the bootloader marked
         // us PENDING_VERIFY anyway (e.g., first OTA from a previous firmware
@@ -1223,8 +1362,10 @@ static void init_ota_probation()
 
     // Persist the bumped strike count BEFORE marking valid. Order matters: a
     // crash between the increment and mark_valid still gives us a higher
-    // strike count on the next boot.
-    ota_health_write(marker_slot, marker_ver, next_strikes);
+    // strike count on the next boot. Preserve the manual flag across the
+    // rewrite so self_test_task still relaxes the STA requirement for manual
+    // images on this boot.
+    ota_health_write(marker_slot, marker_ver, next_strikes, marker_manual);
 
     // Neuter the bootloader's 1-strike rollback so we can manage attempts
     // ourselves. self_test_task will clear the marker on success.
@@ -1372,7 +1513,8 @@ static esp_err_t install_https_ota_with_verify(const published_update_info_t *in
     // slot (the one we just wrote).
     const esp_partition_t *target = esp_ota_get_next_update_partition(nullptr);
     if (target) {
-        esp_err_t herr = ota_health_write(target->label, info->version, 0);
+        // Published update: manual=false, so self-test requires STA + Matter.
+        esp_err_t herr = ota_health_write(target->label, info->version, 0, false);
         if (herr != ESP_OK) {
             ESP_LOGW(TAG, "ota_health_write failed: %s (rollback safety degraded)",
                      esp_err_to_name(herr));
@@ -1560,8 +1702,9 @@ static void self_test_task(void *arg)
     char marker_slot[16] = "";
     char marker_ver[APP_AUTO_UPDATE_VERSION_MAX] = "";
     uint8_t strikes = 0;
+    bool marker_manual = false;
     esp_err_t err = ota_health_read(marker_slot, sizeof(marker_slot),
-                                    marker_ver, sizeof(marker_ver), &strikes);
+                                    marker_ver, sizeof(marker_ver), &strikes, &marker_manual);
     if (err != ESP_OK || marker_slot[0] == '\0' ||
         std::strcmp(marker_slot, running->label) != 0) {
         // No active probation — nothing to verify.
@@ -1570,12 +1713,16 @@ static void self_test_task(void *arg)
         return;
     }
 
-    ESP_LOGI(TAG, "self-test: probation active (ver=%s strikes=%u), waiting up to %llu ms for STA + Matter",
-             marker_ver, strikes, APP_UPDATE_SELF_TEST_TIMEOUT_MS);
+    ESP_LOGI(TAG, "self-test: probation active (ver=%s strikes=%u manual=%d), waiting up to %llu ms for %s",
+             marker_ver, strikes, (int) marker_manual, APP_UPDATE_SELF_TEST_TIMEOUT_MS,
+             marker_manual ? "Matter" : "STA + Matter");
 
     const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(APP_UPDATE_SELF_TEST_TIMEOUT_MS);
     while (xTaskGetTickCount() < deadline) {
-        bool sta_ok = s_sta_ip[0] != '\0';
+        // Manual (bench-flashed) images may never join home Wi-Fi, so they are
+        // promoted on Matter readiness alone. Published images still require an
+        // STA IP as evidence the update didn't break connectivity.
+        bool sta_ok = marker_manual || (s_sta_ip[0] != '\0');
         bool matter_ok = matter_is_ready();
         if (sta_ok && matter_ok) {
             ota_health_clear();
@@ -2406,11 +2553,28 @@ static bool request_is_from_softap(httpd_req_t *req)
         return false;
     }
 
+    int sockfd = httpd_req_to_sockfd(req);
+    if (sockfd < 0) {
+        return false;
+    }
+
     struct sockaddr_in peer = {};
     socklen_t peer_len = sizeof(peer);
-    int sockfd = httpd_req_to_sockfd(req);
-    if (sockfd < 0 || getpeername(sockfd, reinterpret_cast<struct sockaddr *>(&peer), &peer_len) < 0 ||
+    if (getpeername(sockfd, reinterpret_cast<struct sockaddr *>(&peer), &peer_len) < 0 ||
         peer.sin_family != AF_INET) {
+        return false;
+    }
+
+    // Identify which interface accepted the connection by its LOCAL address.
+    // The SoftAP netif answers on its own IP (e.g. 192.168.4.1), which is
+    // distinct from the DHCP-assigned STA IP even when the upstream LAN also
+    // uses 192.168.4.0/24. A pure peer-subnet mask compare fails OPEN under
+    // that overlap (a LAN client masks into the AP subnet), so interface
+    // identity — not subnet membership — is the real admin boundary.
+    struct sockaddr_in local = {};
+    socklen_t local_len = sizeof(local);
+    if (getsockname(sockfd, reinterpret_cast<struct sockaddr *>(&local), &local_len) < 0 ||
+        local.sin_family != AF_INET) {
         return false;
     }
 
@@ -2419,7 +2583,12 @@ static bool request_is_from_softap(httpd_req_t *req)
         return false;
     }
 
-    return (peer.sin_addr.s_addr & ap_info.netmask.addr) == (ap_info.ip.addr & ap_info.netmask.addr);
+    // Authoritative check: the request arrived on the SoftAP interface (local
+    // address == AP IP). Keep the peer-subnet compare as an additional guard.
+    const bool on_ap_iface = local.sin_addr.s_addr == ap_info.ip.addr;
+    const bool peer_in_ap_subnet =
+        (peer.sin_addr.s_addr & ap_info.netmask.addr) == (ap_info.ip.addr & ap_info.netmask.addr);
+    return on_ap_iface && peer_in_ap_subnet;
 }
 
 static esp_err_t require_softap_admin(httpd_req_t *req);
@@ -2487,10 +2656,16 @@ static void sync_matter_state_work_handler(intptr_t arg)
 
     s_syncing_matter = false;
     if (err == ESP_OK) {
+        // Update the Matter trackers under the state mutex: control_post_handler
+        // writes s_matter_x/y under the same lock, and this handler runs on the
+        // CHIP thread. Keep the critical section to just the assignments — do
+        // not hold the mutex across the attribute::update calls above.
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
         s_matter_hue = hue;
         s_matter_saturation = saturation;
         s_matter_x = current_x;
         s_matter_y = current_y;
+        xSemaphoreGive(s_state_mutex);
     }
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Matter attribute sync failed: %s", esp_err_to_name(err));
@@ -2509,6 +2684,121 @@ static esp_err_t sync_matter_state_from_led_state()
         return ESP_FAIL;
     }
     return ESP_OK;
+}
+
+// ---- Time subsystem, schedules, and the automatic on/off scheduler ---------
+
+static void apply_tz()
+{
+    setenv("TZ", s_tz, 1);
+    tzset();
+}
+
+static bool time_is_valid()
+{
+    return time(NULL) > 1700000000;
+}
+
+static void start_sntp_once()
+{
+    static bool s_sntp_started = false;
+    if (s_sntp_started) {
+        return;
+    }
+    s_sntp_started = true;
+    esp_netif_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG(APP_SNTP_SERVER);
+    esp_err_t err = esp_netif_sntp_init(&config);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "SNTP init failed: %s", esp_err_to_name(err));
+    }
+    apply_tz();
+}
+
+static esp_err_t save_schedules()
+{
+    esp_err_t ret = ESP_OK;
+    nvs_handle_t nvs_handle = 0;
+    ESP_RETURN_ON_ERROR(nvs_open(APP_NVS_NAMESPACE, NVS_READWRITE, &nvs_handle), TAG, "nvs_open failed");
+    ESP_GOTO_ON_ERROR(nvs_set_blob(nvs_handle, "sched", s_schedules, sizeof(s_schedules)), cleanup, TAG,
+                      "save schedules failed");
+    ESP_GOTO_ON_ERROR(nvs_set_str(nvs_handle, "tz", s_tz), cleanup, TAG, "save tz failed");
+    ESP_GOTO_ON_ERROR(nvs_commit(nvs_handle), cleanup, TAG, "nvs_commit failed");
+
+cleanup:
+    nvs_close(nvs_handle);
+    return ret;
+}
+
+static void load_schedules()
+{
+    nvs_handle_t nvs_handle = 0;
+    if (nvs_open(APP_NVS_NAMESPACE, NVS_READONLY, &nvs_handle) == ESP_OK) {
+        size_t blob_len = 0;
+        if (nvs_get_blob(nvs_handle, "sched", nullptr, &blob_len) == ESP_OK &&
+            blob_len == sizeof(s_schedules)) {
+            nvs_get_blob(nvs_handle, "sched", s_schedules, &blob_len);
+        }
+        size_t tz_len = sizeof(s_tz);
+        nvs_get_str(nvs_handle, "tz", s_tz, &tz_len);
+        nvs_close(nvs_handle);
+    }
+    apply_tz();
+}
+
+// Toggle power only, preserving color/brightness/effect, through the same
+// commit path used elsewhere. Safe to call from a FreeRTOS task.
+static void apply_power_action(bool on)
+{
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    if (s_led_state.power != on) {
+        s_led_state.power = on;
+        save_state_to_nvs(&s_led_state);
+    }
+    xSemaphoreGive(s_state_mutex);
+    notify_effect_task();
+    sync_matter_state_from_led_state();
+}
+
+static void schedule_task(void *arg)
+{
+    (void) arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(10000));
+
+        // Relative one-shot timer (monotonic; survives without time sync).
+        bool relative_fire = false;
+        uint8_t relative_action = 0;
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        int64_t deadline = s_relative_deadline_us;
+        if (deadline != 0 && esp_timer_get_time() >= deadline) {
+            relative_action = s_relative_action;
+            s_relative_deadline_us = 0;
+            relative_fire = true;
+        }
+        xSemaphoreGive(s_state_mutex);
+        if (relative_fire) {
+            ESP_LOGI(TAG, "Relative timer fired: power %s", relative_action == 1 ? "on" : "off");
+            apply_power_action(relative_action == 1);
+        }
+
+        // Fixed wall-clock schedules (require a valid clock via SNTP).
+        if (time_is_valid()) {
+            time_t now = time(NULL);
+            struct tm lt;
+            localtime_r(&now, &lt);
+            int32_t cur_min = (int32_t)(now / 60);
+            for (size_t i = 0; i < APP_MAX_SCHEDULES; ++i) {
+                schedule_entry_t entry = s_schedules[i];
+                if (entry.enabled && (entry.days & (1u << lt.tm_wday)) && entry.hour == lt.tm_hour &&
+                    entry.minute == lt.tm_min && s_sched_last_fired_min[i] != cur_min) {
+                    s_sched_last_fired_min[i] = cur_min;
+                    ESP_LOGI(TAG, "Schedule %u fired at %02d:%02d: power %s", (unsigned)i, lt.tm_hour,
+                             lt.tm_min, entry.action == 1 ? "on" : "off");
+                    apply_power_action(entry.action == 1);
+                }
+            }
+        }
+    }
 }
 
 static esp_err_t send_state_json(httpd_req_t *req)
@@ -2611,6 +2901,34 @@ static esp_err_t send_state_json(httpd_req_t *req)
     cJSON_AddStringToObject(root, "qr_code", expose_onboarding ? s_matter_qr_code : "");
     cJSON_AddStringToObject(root, "qr_url", expose_onboarding ? s_matter_qr_url : "");
 
+    // Time subsystem + relative timer (compact fields; schedules live on
+    // /api/schedule to keep this response lean).
+    const bool time_valid = time_is_valid();
+    char now_local[20] = "";
+    if (time_valid) {
+        time_t now = time(NULL);
+        struct tm lt = {};
+        localtime_r(&now, &lt);
+        strftime(now_local, sizeof(now_local), "%Y-%m-%d %H:%M:%S", &lt);
+    }
+    cJSON_AddBoolToObject(root, "time_valid", time_valid);
+    cJSON_AddStringToObject(root, "now_local", now_local);
+    int64_t rel_deadline = 0;
+    uint8_t rel_action = 0;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    rel_deadline = s_relative_deadline_us;
+    rel_action = s_relative_action;
+    xSemaphoreGive(s_state_mutex);
+    const bool rel_active = rel_deadline != 0;
+    int rel_remaining_s = 0;
+    if (rel_active) {
+        int64_t rem_us = rel_deadline - esp_timer_get_time();
+        rel_remaining_s = rem_us > 0 ? static_cast<int>(rem_us / 1000000) : 0;
+    }
+    cJSON_AddBoolToObject(root, "relative_active", rel_active);
+    cJSON_AddNumberToObject(root, "relative_action", rel_action);
+    cJSON_AddNumberToObject(root, "relative_remaining_s", rel_remaining_s);
+
     char *response = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (!response) {
@@ -2699,7 +3017,9 @@ static esp_err_t control_post_handler(httpd_req_t *req)
     updated = s_led_state;
     xSemaphoreGive(s_state_mutex);
 
-    cJSON *count = cJSON_GetObjectItemCaseSensitive(root, "count");
+    // LED "count" is a Configuration item, settable only via the SoftAP-gated
+    // /api/config. This ungated handler (also POST /api/state) intentionally
+    // does not parse or apply count.
     cJSON *brightness = cJSON_GetObjectItemCaseSensitive(root, "brightness");
     cJSON *color = cJSON_GetObjectItemCaseSensitive(root, "color");
     cJSON *effect = cJSON_GetObjectItemCaseSensitive(root, "effect");
@@ -2707,7 +3027,7 @@ static esp_err_t control_post_handler(httpd_req_t *req)
     cJSON *effect_color = cJSON_GetObjectItemCaseSensitive(root, "effect_color");
     cJSON *power = cJSON_GetObjectItemCaseSensitive(root, "power");
 
-    if ((count && !cJSON_IsNumber(count)) || !cJSON_IsNumber(brightness) || !cJSON_IsString(color) ||
+    if (!cJSON_IsNumber(brightness) || !cJSON_IsString(color) ||
         !cJSON_IsString(effect) || !cJSON_IsArray(effect_params) ||
         !(cJSON_IsString(effect_color) || effect_color == nullptr) ||
         !(cJSON_IsBool(power) || power == nullptr)) {
@@ -2716,9 +3036,6 @@ static esp_err_t control_post_handler(httpd_req_t *req)
         return httpd_resp_sendstr(req, "Missing fields");
     }
 
-    if (cJSON_IsNumber(count)) {
-        updated.count = static_cast<uint16_t>(count->valuedouble);
-    }
     updated.brightness = clamp_u8(static_cast<int>(brightness->valuedouble));
     if (!parse_hex_color(color->valuestring, &updated.red, &updated.green, &updated.blue)) {
         cJSON_Delete(root);
@@ -2746,16 +3063,12 @@ static esp_err_t control_post_handler(httpd_req_t *req)
         updated.power = updated.brightness > 0;
     }
     clamp_state(&updated);
-    const bool count_present = cJSON_IsNumber(count);
     const bool effect_color_present = effect_color != nullptr;
     cJSON_Delete(root);
 
     esp_err_t err = ESP_OK;
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     led_state_t committed = s_led_state;
-    if (count_present) {
-        committed.count = updated.count;
-    }
     committed.brightness = updated.brightness;
     committed.red = updated.red;
     committed.green = updated.green;
@@ -2773,12 +3086,16 @@ static esp_err_t control_post_handler(httpd_req_t *req)
     err = save_state_to_nvs(&s_led_state);
     xSemaphoreGive(s_state_mutex);
 
+    // RAM state is already committed, so drive the strip regardless of whether
+    // the NVS persist succeeded — otherwise /api/state would report the new
+    // state while the physical strip stays on the old frame.
+    notify_effect_task();
+
     if (err != ESP_OK) {
         httpd_resp_set_status(req, "500 Internal Server Error");
         return httpd_resp_sendstr(req, "Failed to update LED state");
     }
 
-    notify_effect_task();
     sync_matter_state_from_led_state();
 
     return send_state_json(req);
@@ -2847,12 +3164,15 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     xSemaphoreGive(s_state_mutex);
     cJSON_Delete(root);
 
+    // Apply to the strip regardless of the persistence result (RAM state is
+    // already updated); still report 500 if the save itself failed.
+    notify_effect_task();
+
     if (err != ESP_OK) {
         httpd_resp_set_status(req, "500 Internal Server Error");
         return httpd_resp_sendstr(req, "Failed to save configuration");
     }
 
-    notify_effect_task();
     return send_state_json(req);
 }
 
@@ -3095,7 +3415,9 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
         result = send_message_json(req, "Firmware metadata could not be read");
         goto cleanup;
     }
-    result = ota_health_write(update_partition->label, manual_desc.version, 0);
+    // manual=true: this image self-tests on Matter readiness alone so a
+    // bench-flashed device that never joins home Wi-Fi is not rolled back.
+    result = ota_health_write(update_partition->label, manual_desc.version, 0, true);
     if (result != ESP_OK) {
         ESP_LOGE(TAG, "Failed to write manual OTA probation marker: %s", esp_err_to_name(result));
         httpd_resp_set_status(req, "500 Internal Server Error");
@@ -3259,6 +3581,232 @@ static void effect_task(void *arg)
     }
 }
 
+// ---- Schedule / timer HTTP endpoints ---------------------------------------
+
+static esp_err_t schedule_get_handler(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "Failed to build response");
+    }
+
+    schedule_entry_t schedules[APP_MAX_SCHEDULES];
+    char tz[sizeof(s_tz)] = "";
+    int64_t rel_deadline = 0;
+    uint8_t rel_action = 0;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    std::memcpy(schedules, s_schedules, sizeof(schedules));
+    copy_string_value(tz, sizeof(tz), s_tz);
+    rel_deadline = s_relative_deadline_us;
+    rel_action = s_relative_action;
+    xSemaphoreGive(s_state_mutex);
+
+    const bool time_valid = time_is_valid();
+    char now_local[20] = "";
+    if (time_valid) {
+        time_t now = time(NULL);
+        struct tm lt = {};
+        localtime_r(&now, &lt);
+        strftime(now_local, sizeof(now_local), "%Y-%m-%d %H:%M:%S", &lt);
+    }
+    cJSON_AddBoolToObject(root, "time_valid", time_valid);
+    cJSON_AddStringToObject(root, "now_local", now_local);
+    cJSON_AddStringToObject(root, "tz", tz);
+
+    cJSON *arr = cJSON_AddArrayToObject(root, "schedules");
+    for (size_t i = 0; i < APP_MAX_SCHEDULES; ++i) {
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddNumberToObject(item, "enabled", schedules[i].enabled);
+        cJSON_AddNumberToObject(item, "hour", schedules[i].hour);
+        cJSON_AddNumberToObject(item, "minute", schedules[i].minute);
+        cJSON_AddNumberToObject(item, "days", schedules[i].days);
+        cJSON_AddNumberToObject(item, "action", schedules[i].action);
+        cJSON_AddItemToArray(arr, item);
+    }
+
+    cJSON *relative = cJSON_AddObjectToObject(root, "relative");
+    const bool rel_active = rel_deadline != 0;
+    int rel_remaining_s = 0;
+    if (rel_active) {
+        int64_t rem_us = rel_deadline - esp_timer_get_time();
+        rel_remaining_s = rem_us > 0 ? static_cast<int>(rem_us / 1000000) : 0;
+    }
+    cJSON_AddBoolToObject(relative, "active", rel_active);
+    cJSON_AddNumberToObject(relative, "action", rel_action);
+    cJSON_AddNumberToObject(relative, "remaining_s", rel_remaining_s);
+
+    char *response = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!response) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "Failed to encode response");
+    }
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t err = httpd_resp_sendstr(req, response);
+    free(response);
+    return err;
+}
+
+static esp_err_t schedule_post_handler(httpd_req_t *req)
+{
+    esp_err_t access_err = require_softap_admin(req);
+    if (access_err != ESP_OK) {
+        return access_err;
+    }
+
+    // 8 schedules + tz stay well under 2 KB; keep a dedicated limit here since
+    // read_request_body() enforces the smaller APP_POST_BODY_LIMIT.
+    if (req->content_len <= 0 || req->content_len >= 2048) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "Invalid request body");
+    }
+
+    char *body = static_cast<char *>(malloc(req->content_len + 1));
+    if (!body) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "Out of memory");
+    }
+    int remaining = req->content_len;
+    int offset = 0;
+    while (remaining > 0) {
+        int received = httpd_req_recv(req, body + offset, remaining);
+        if (received <= 0) {
+            free(body);
+            httpd_resp_set_status(req, "400 Bad Request");
+            return httpd_resp_sendstr(req, "Failed to read request body");
+        }
+        offset += received;
+        remaining -= received;
+    }
+    body[offset] = '\0';
+
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+    if (!root) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "Invalid JSON");
+    }
+
+    cJSON *tz = cJSON_GetObjectItemCaseSensitive(root, "tz");
+    cJSON *schedules = cJSON_GetObjectItemCaseSensitive(root, "schedules");
+    if ((tz && !cJSON_IsString(tz)) || (schedules && !cJSON_IsArray(schedules))) {
+        cJSON_Delete(root);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "Invalid schedule payload");
+    }
+    if (tz && std::strlen(tz->valuestring) > sizeof(s_tz) - 1) {
+        cJSON_Delete(root);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "Time zone string too long");
+    }
+
+    bool tz_changed = false;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    if (tz) {
+        copy_string_value(s_tz, sizeof(s_tz), tz->valuestring);
+        tz_changed = true;
+    }
+    std::memset(s_schedules, 0, sizeof(s_schedules));
+    for (size_t i = 0; i < APP_MAX_SCHEDULES; ++i) {
+        s_sched_last_fired_min[i] = -1;
+    }
+    if (schedules) {
+        int n = cJSON_GetArraySize(schedules);
+        if (n > APP_MAX_SCHEDULES) {
+            n = APP_MAX_SCHEDULES;
+        }
+        for (int i = 0; i < n; ++i) {
+            cJSON *item = cJSON_GetArrayItem(schedules, i);
+            if (!cJSON_IsObject(item)) {
+                continue;
+            }
+            cJSON *enabled = cJSON_GetObjectItemCaseSensitive(item, "enabled");
+            cJSON *hour = cJSON_GetObjectItemCaseSensitive(item, "hour");
+            cJSON *minute = cJSON_GetObjectItemCaseSensitive(item, "minute");
+            cJSON *days = cJSON_GetObjectItemCaseSensitive(item, "days");
+            cJSON *action = cJSON_GetObjectItemCaseSensitive(item, "action");
+            const bool enabled_on = cJSON_IsTrue(enabled) ||
+                                    (cJSON_IsNumber(enabled) && enabled->valuedouble != 0);
+            const bool action_on = cJSON_IsTrue(action) ||
+                                   (cJSON_IsNumber(action) && action->valuedouble != 0);
+            s_schedules[i].enabled = enabled_on ? 1 : 0;
+            s_schedules[i].hour = cJSON_IsNumber(hour)
+                                      ? static_cast<uint8_t>(std::clamp(static_cast<int>(hour->valuedouble), 0, 23))
+                                      : 0;
+            s_schedules[i].minute = cJSON_IsNumber(minute)
+                                        ? static_cast<uint8_t>(std::clamp(static_cast<int>(minute->valuedouble), 0, 59))
+                                        : 0;
+            s_schedules[i].days = cJSON_IsNumber(days)
+                                      ? static_cast<uint8_t>(std::clamp(static_cast<int>(days->valuedouble), 0, 127))
+                                      : 0;
+            s_schedules[i].action = action_on ? 1 : 0;
+        }
+    }
+    xSemaphoreGive(s_state_mutex);
+    cJSON_Delete(root);
+
+    if (tz_changed) {
+        apply_tz();
+    }
+    esp_err_t save_err = save_schedules();
+    if (save_err != ESP_OK) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "Failed to save schedules");
+    }
+
+    return schedule_get_handler(req);
+}
+
+static esp_err_t timer_post_handler(httpd_req_t *req)
+{
+    char *body = read_request_body(req);
+    if (!body) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "Failed to read request body");
+    }
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+    if (!root) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "Invalid JSON");
+    }
+
+    cJSON *action = cJSON_GetObjectItemCaseSensitive(root, "action");
+    cJSON *minutes = cJSON_GetObjectItemCaseSensitive(root, "minutes");
+    if (!cJSON_IsNumber(action) || !cJSON_IsNumber(minutes)) {
+        cJSON_Delete(root);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "Missing fields");
+    }
+    int action_val = static_cast<int>(action->valuedouble);
+    if (action_val != 0 && action_val != 1) {
+        cJSON_Delete(root);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "Invalid action");
+    }
+    int minutes_val = std::clamp(static_cast<int>(minutes->valuedouble), 0, 1440);
+    cJSON_Delete(root);
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    if (minutes_val <= 0) {
+        s_relative_deadline_us = 0;
+    } else {
+        s_relative_action = static_cast<uint8_t>(action_val ? 1 : 0);
+        s_relative_deadline_us = esp_timer_get_time() + static_cast<int64_t>(minutes_val) * 60 * 1000000;
+    }
+    xSemaphoreGive(s_state_mutex);
+
+    char message[64];
+    if (minutes_val <= 0) {
+        std::snprintf(message, sizeof(message), "Timer cancelled.");
+    } else {
+        std::snprintf(message, sizeof(message), "Will turn %s in %d minute%s.",
+                      action_val ? "on" : "off", minutes_val, minutes_val == 1 ? "" : "s");
+    }
+    return send_message_json(req, message);
+}
+
 static void start_webserver()
 {
     if (s_http_server) {
@@ -3266,7 +3814,7 @@ static void start_webserver()
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 24;
+    config.max_uri_handlers = 28;
     config.stack_size = 8192;
     config.recv_wait_timeout = 30;
     config.send_wait_timeout = 30;
@@ -3333,6 +3881,21 @@ static void start_webserver()
     factory_reset_post.method = HTTP_POST;
     factory_reset_post.handler = factory_reset_post_handler;
 
+    httpd_uri_t schedule_get = {};
+    schedule_get.uri = "/api/schedule";
+    schedule_get.method = HTTP_GET;
+    schedule_get.handler = schedule_get_handler;
+
+    httpd_uri_t schedule_post = {};
+    schedule_post.uri = "/api/schedule";
+    schedule_post.method = HTTP_POST;
+    schedule_post.handler = schedule_post_handler;
+
+    httpd_uri_t timer_post = {};
+    timer_post.uri = "/api/timer";
+    timer_post.method = HTTP_POST;
+    timer_post.handler = timer_post_handler;
+
     httpd_uri_t generate_204 = {};
     generate_204.uri = "/generate_204";
     generate_204.method = HTTP_GET;
@@ -3375,6 +3938,9 @@ static void start_webserver()
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &reboot_post));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &revert_post));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &factory_reset_post));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &schedule_get));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &schedule_post));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &timer_post));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &generate_204));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &hotspot_detect));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &ncsi));
@@ -3571,6 +4137,7 @@ static void ip_event_handler(void *arg, esp_event_base_t event_base, int32_t eve
         s_sta_last_ip_ms = esp_log_timestamp();
         ESP_LOGI(TAG, "Matter station IP: %s", s_sta_ip);
         ESP_LOGI(TAG, "LAN web UI available at http://%s", s_sta_ip);
+        start_sntp_once();
         if (s_auto_update_task) {
             // Refresh available-version info — never auto-install.
             set_pending_update_mode(published_update_mode_t::kCheckOnly);
@@ -3713,9 +4280,9 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
     s_led_state = updated;
     err = persist_state_locked();
     xSemaphoreGive(s_state_mutex);
-    if (err == ESP_OK) {
-        notify_effect_task();
-    }
+    // Drive the strip even if the NVS persist failed — RAM state is the source
+    // of truth for the effect task; the persist error is still returned.
+    notify_effect_task();
     return err;
 }
 
@@ -3878,6 +4445,7 @@ extern "C" void app_main()
     reset_effect_colors_to_defaults(&s_led_state);
     set_generated_ap_credentials();
     bool loaded_state_from_nvs = load_state_from_nvs();
+    load_schedules();
     apply_startup_power_policy();
     init_led_strip();
 
@@ -3898,6 +4466,7 @@ extern "C" void app_main()
     xTaskCreate(self_test_task, "self_test", 4096, nullptr, 5, nullptr);
     xTaskCreate(effect_task, "effect_task", 4096, nullptr, 4, &s_effect_task);
     xTaskCreate(captive_dns_task, "captive_dns", 4096, nullptr, 4, nullptr);
+    xTaskCreate(schedule_task, "schedule", 4096, nullptr, 4, nullptr);
 
     ESP_LOGI(TAG, "Project ready. LEDs=%u power=%u brightness=%u effect=%s color=#%02X%02X%02X",
              s_led_state.count, s_led_state.power, s_led_state.brightness, effect_to_name(s_led_state.effect),
