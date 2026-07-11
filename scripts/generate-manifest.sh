@@ -11,6 +11,8 @@
 #                      match RELEASE_TAG after an optional leading "v" is removed
 #   SIGNING_KEY_PEM — contents of the ECDSA P-256 private key in PEM form
 #                     (typically from a repo secret)
+#   ROLLOUT_PERCENT — optional staged-rollout percentage (integer 0..100);
+#                     defaults to 100. Set to 0 to halt an in-flight release.
 # Outputs (current dir):
 #   manifest.json
 #   manifest.json.sig   (raw DER-encoded ECDSA signature over the manifest bytes)
@@ -38,6 +40,12 @@ fi
 
 if [ ! -s "$APP_BIN" ]; then
   echo "APP_BIN not found: $APP_BIN" >&2
+  exit 1
+fi
+
+rollout_percent="${ROLLOUT_PERCENT:-100}"
+if [[ ! "$rollout_percent" =~ ^[0-9]+$ ]] || [ "$rollout_percent" -lt 0 ] || [ "$rollout_percent" -gt 100 ]; then
+  echo "ERROR: ROLLOUT_PERCENT must be an integer from 0 through 100: $rollout_percent" >&2
   exit 1
 fi
 
@@ -72,12 +80,12 @@ if [ -z "$python_bin" ]; then
 fi
 
 "$python_bin" - "$version" "$REPO_SLUG" "$asset_url" "${IDF_REF:-}" "${MATTER_REF:-}" \
-  "$sha256" "$size" <<'PY'
+  "$sha256" "$size" "$rollout_percent" <<'PY'
 import datetime
 import json
 import sys
 
-version, repo_slug, asset_url, idf_ref, matter_ref, sha256, size = sys.argv[1:]
+version, repo_slug, asset_url, idf_ref, matter_ref, sha256, size, rollout_percent = sys.argv[1:]
 
 manifest = {
     "version": version,
@@ -91,7 +99,7 @@ manifest = {
         "size": int(size),
     },
     "rollout": {
-        "percent": 100,
+        "percent": int(rollout_percent),
         "cohorts": ["*"],
     },
 }
