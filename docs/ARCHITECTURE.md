@@ -69,7 +69,8 @@ recovery only.
 - LAN clients may inspect status and control LEDs.
 - Configuration, OTA, reboot, revert, and factory reset require a SoftAP
   client.
-- Matter onboarding codes are returned only to SoftAP clients.
+- Matter onboarding codes are returned only to SoftAP clients while the Matter
+  commissioning window is open.
 
 The current SoftAP boundary is a network-location check, not a replacement for
 authenticated HTTPS sessions. A future production hardening pass should add

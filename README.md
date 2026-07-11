@@ -10,7 +10,7 @@ It exposes the strip in two ways:
 - Periodic background checks against the latest published GitHub release; manual or automatic install with a signed-manifest verification chain
 - A firmware revert action that boots back into the other OTA slot
 - A factory reset action that clears Matter pairing, Wi-Fi AP config, and saved LED settings
-- Built-in LED effects: `glow`, `rainbow`, `chase`, `sparkle`, `wave`
+- Built-in LED effects: `glow`, `rainbow`, `chase`, `sparkle`, `wave`, plus a plain `Solid` color mode
 - Per-effect controls in the web UI with unique meanings for each animation
 
 The firmware starts a Wi-Fi SoftAP, serves the control page directly from the board, and includes captive-portal style redirects plus a small DNS responder so phones and laptops are more likely to open the page automatically. After the device joins your normal Wi-Fi through Matter commissioning, the same web UI is also reachable on its LAN IP.
@@ -67,13 +67,50 @@ python -m esptool --chip esp32c6 -p COM6 -b 460800 --before default-reset --afte
 
 The device page is split into three tabs:
 
-- `Overview`: Matter state, AP and LAN web UI URLs, current firmware version, running slot, revert target, latest available release, update status
-- `Configuration`: LED count, SoftAP SSID/password, the Firmware Update card (Current vs. Available version, **Install Update** button, Check For Updates button, and a manual **Install From File** path), revert button, factory reset, reboot
-- `Control`: brightness, color, and one sub-tab per effect with its own parameters
+- `Overview`: Matter state (including fabric count and commissioning-window status), a `Wi-Fi State` card (active AP SSID, station status/SSID, BSSID/channel, signal/RSSI, last disconnect reason, and an AP-restart-needed flag), AP and LAN web UI URLs, current firmware version, running slot, next OTA slot, revert target, latest available release, update status
+- `Configuration`: LED count, SoftAP SSID/password, a **Schedules** card and timezone field (see [Timers & schedules](#timers--schedules)), an **Install published updates automatically** toggle (default on), the Firmware Update card (Current vs. Available version, **Install Update** button, Check For Updates button, and a manual **Install From File** path), revert button, factory reset, reboot
+- `Control`: brightness, color, a sleep/wake timer (see [Timers & schedules](#timers--schedules)), and one sub-tab per mode — `Solid` (the default) plus the five animated effects — each with its own parameters
 
 The SoftAP SSID and password are the credentials hosted by the ESP32-C6 itself for the local setup page. On a fresh device they are generated automatically and printed to the serial log when the AP starts.
 
 The LAN page is intended for status and LED control. Configuration, firmware updates, reboot, revert, and factory reset are restricted to a client connected to the device SoftAP. The AP password is never returned by the state API; leave the password field blank to keep the current password.
+
+## Timers & schedules
+
+The firmware can switch the strip on or off automatically in two independent ways. Both only toggle **power** — they keep the current color, brightness, and effect, exactly as if you had pressed the power control yourself.
+
+### Sleep/wake timer (relative)
+
+The `Control` tab has a one-shot sleep/wake timer: turn the strip on or off after a chosen number of minutes (up to 24 h). It runs off the board's internal monotonic clock, so it works with **no internet and no clock sync** — connect to the device SoftAP and set it, and it fires even on a SoftAP-only device that never joined your Wi-Fi. It is also settable over the LAN, like the other LED controls.
+
+It is deliberately lightweight:
+
+- **One-shot.** After it fires once, it is done. Setting a new timer replaces any pending one; setting `0` (or a negative) minutes cancels it.
+- **Not persistent.** The pending timer lives in RAM only, so a reboot or power cycle cancels it. Use a fixed schedule if you need something that survives reboot.
+
+### Fixed schedules
+
+The `Configuration` tab has a **Schedules** card with up to **8** entries. Each entry has:
+
+- a time of day (`HH:MM`),
+- a day-of-week selection (any combination of Sunday–Saturday),
+- an **On** or **Off** action.
+
+Schedules persist across reboot (stored in NVS), so they keep working after a power cycle.
+
+Because a schedule fires at a wall-clock time, the device needs to know the real time. It syncs its clock over **SNTP** (default server `pool.ntp.org`), which requires the device to have **internet access** — i.e. it has joined your Wi-Fi through Matter commissioning. Until the clock syncs, schedules do not fire and the UI shows the device time as not-yet-synced. Once the time is valid, the UI shows the current local time and schedules begin firing at their configured times.
+
+Editing schedules and the timezone is treated as persistent configuration, so — like everything else on the `Configuration` tab — it requires a client connected to the device SoftAP. Reading the current schedule state and device time is not restricted.
+
+### Timezone
+
+Schedule times and the displayed device time are interpreted in the timezone set in the `Configuration` tab. The value is a **POSIX TZ string** (default `UTC0`). This is the low-level POSIX format, not an IANA/Olson name — `America/New_York` will **not** work; use the equivalent POSIX rule instead. Examples:
+
+- Central Europe (with daylight saving): `CET-1CEST,M3.5.0,M10.5.0/3`
+- US Eastern (with daylight saving): `EST5EDT`
+- No offset / plain UTC: `UTC0` (the default)
+
+The timezone affects both the fixed schedules and the local time shown in the UI. The relative sleep/wake timer is unaffected — it counts elapsed minutes, not wall-clock time.
 
 ## Pair with Apple Home
 
@@ -84,7 +121,9 @@ The LAN page is intended for status and LED control. Configuration, firmware upd
 5. Scan the Matter QR code from the serial log, or enter the manual setup code.
 6. Finish commissioning while the phone is connected over BLE and the ESP32-C6 has network access.
 
-The local web page also shows the current Matter state, manual setup code, QR URL, and both web UI addresses.
+The local web page always shows the current Matter state and both web UI addresses. The manual setup code and QR URL appear only for a client connected to the device SoftAP while the Matter pairing window is open.
+
+As an alternative to reading the serial log, a client connected to the device SoftAP can press **Open 5-Minute Pairing Window** on the `Overview` card. On a not-yet-commissioned device this re-opens Matter commissioning for five minutes and re-exposes the manual setup code and QR link on the Overview page. It works only from a SoftAP client and only while the device has not been commissioned yet.
 
 ## OTA updates
 
@@ -122,7 +161,7 @@ So a broken release has three layers of defense:
 | Boots, but Wi-Fi/Matter never come up                  | self-test timeout (×2)   |
 | Panics or hangs the watchdog before self-test runs    | next boot's strike count |
 
-Each device's first poll is jittered randomly in `[0, CONFIG_APP_UPDATE_INITIAL_JITTER_MIN]` minutes after Wi-Fi up. The `Check For Updates` button bypasses the jitter. When automatic installation is enabled, in-cohort devices install newer releases after the periodic check; when it is disabled, the device only reports the update and installation requires the `Install Update` button.
+Each device schedules its first poll with a random `[0, CONFIG_APP_UPDATE_INITIAL_JITTER_MIN]`-minute delay counted from boot. Getting a LAN IP (the `GOT_IP` event) wakes the update task and runs the first check immediately, so on a device that joins Wi-Fi the first on-network check effectively fires at Wi-Fi-up with no delay; the `[0, jitter]` delay only elapses if Wi-Fi never comes up. The `Check For Updates` button also bypasses the wait. When automatic installation is enabled, in-cohort devices install newer releases after the periodic check; when it is disabled, the device only reports the update and installation requires the `Install Update` button.
 
 ### Publishing a release
 
@@ -180,8 +219,8 @@ To bootstrap a fresh fork: generate a new keypair as above, replace the placehol
 - `glow`: pulse speed, glow floor, pulse depth
 - `rainbow`: drift speed, rainbow length, color blend, start offset, contrast
 - `chase`: chase speed, tail length, tail sharpness
-- `sparkle`: spark density, base glow, twinkle speed
+- `sparkle`: spark density, base glow, twinkle speed. Sparkle is the only effect with a dedicated per-effect color control (`Sparkle Color`, default white), shown as an extra swatch when the Sparkle tab is selected.
 - `wave`: wave speed, wavelength, wave depth
 - The LED count set in the page is clamped to the compiled-in maximum.
-- LED GPIO and maximum pixel count are build-time settings. Run `idf.py menuconfig`, navigate to **ESP32-C6 LED Web — Hardware**, and adjust `APP_LED_GPIO` / `APP_LED_MAX_PIXELS`. For a one-off override, put `CONFIG_APP_LED_GPIO=18` in `sdkconfig.local` (gitignored) before building. The default is GPIO 17, which is D7 on a XIAO ESP32C6.
+- LED GPIO and maximum pixel count are build-time settings. Run `idf.py menuconfig`, navigate to **ESP32-C6 LED Web — Hardware**, and adjust `APP_LED_GPIO` / `APP_LED_MAX_PIXELS`, or edit `sdkconfig.defaults` (for example `CONFIG_APP_LED_GPIO=18`); then rebuild. Note that `sdkconfig` is checked into this repo, so a plain `idf.py build` uses the committed configuration. The default is GPIO 17, which is D7 on a XIAO ESP32C6.
 - The serial monitor is the most reliable place to get the first Matter pairing codes after boot.
