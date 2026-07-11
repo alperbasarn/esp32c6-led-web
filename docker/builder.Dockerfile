@@ -42,7 +42,11 @@ RUN set -eux; \
 
 # Install esp-matter into the image. Source the IDF environment first so
 # install.sh sees the toolchain; --no-host-tool skips host-only components.
+# IDF_PATH_FORCE=1 makes export.sh trust the IDF_PATH env var instead of trying
+# to auto-detect its own location, which fails under `docker RUN`'s /bin/sh
+# (dash) because it has no BASH_SOURCE.
 RUN set -eux; \
+    export IDF_PATH_FORCE=1; \
     . "$IDF_PATH/export.sh" >/dev/null; \
     cd "$ESP_MATTER_PATH"; \
     ./install.sh --no-host-tool
