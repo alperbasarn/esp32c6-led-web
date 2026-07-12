@@ -1,9 +1,27 @@
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
+# Size tuning so the full feature set (web UI, effects, Matter, dual-slot OTA,
+# timers/schedules) fits the 0x1F0000 OTA app partition. -Os is the right level
+# for a release image; newlib nano formatting is the real space saver (~10-25 KB)
+# and is safe here because the app formats no floating point.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+CONFIG_NEWLIB_NANO_FORMAT=y
+
 # OTA rollback safety: bootloader marks a freshly flashed app as PENDING_VERIFY
 # and requires the app to call esp_ota_mark_app_valid_cancel_rollback() once
 # the self-test passes. Otherwise the next reboot rolls back to the previous slot.
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+CONFIG_APP_LED_GPIO=17
+CONFIG_APP_LED_MAX_PIXELS=256
+CONFIG_APP_RELEASE_REPO="alperbasarn/esp32c6-led-web"
+CONFIG_APP_RELEASE_ASSET_NAME="esp32c6_led_web.bin"
+CONFIG_APP_RELEASE_MANIFEST_NAME="manifest.json"
+CONFIG_APP_RELEASE_MANIFEST_SIG_NAME="manifest.json.sig"
+CONFIG_APP_UPDATE_INTERVAL_HOURS=6
+CONFIG_APP_UPDATE_INITIAL_JITTER_MIN=30
+CONFIG_APP_UPDATE_SELF_TEST_TIMEOUT_S=90
+CONFIG_APP_OTA_SIG_VERIFY=y
 
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y

@@ -4,14 +4,22 @@ on:
   release:
     types:
       - published
-  # Build (without publishing) on every push to main so the build cache is
-  # populated under the default-branch scope. Release events on tags then
-  # restore the cache from main, which is the only cross-ref fallback
-  # GitHub Actions allows.
+  # Build (and run the config guards) on PRs and pushes to main as a CI gate.
+  # The builder image bakes in ESP-IDF + esp-matter, so no cache priming step is
+  # needed. Release-only steps self-skip via `if: github.event_name == 'release'`.
+  pull_request:
   push:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      rollout_percent:
+        description: "Staged rollout percentage (0-100)"
+        default: "100"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   IDF_VERSION: v5.4.1
@@ -21,102 +29,88 @@ env:
   MANIFEST_SIG_ASSET_NAME: manifest.json.sig
   BOOTLOADER_ASSET_NAME: bootloader.bin
   PARTITION_TABLE_ASSET_NAME: partition-table.bin
+  OTA_DATA_INITIAL_ASSET_NAME: ota_data_initial.bin
 
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
+    # ESP-IDF v5.4.1 + esp-matter c6f7672 are baked into this image, so the
+    # toolchain install/cache steps are gone. `credentials` lets the runner pull
+    # the (private) image from GHCR.
+    container:
+      image: ghcr.io/alperbasarn/esp32c6-matter-builder:idf-v5.4.1-matter-c6f7672
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     permissions:
       contents: write
+      packages: read
 
     steps:
       - name: Checkout project
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-
-      # Cache ESP-IDF + its toolchain. Keyed on IDF_VERSION — bump the suffix
-      # ("v2") to force a rebuild if cache contents become stale.
-      - name: Restore ESP-IDF cache
-        id: cache-idf
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/esp-idf
-            ~/.espressif
-          key: idf-${{ env.IDF_VERSION }}-${{ runner.os }}-v2
-
-      - name: Install ESP-IDF (cache miss)
-        if: steps.cache-idf.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          git clone --depth 1 --branch "$IDF_VERSION" --recursive https://github.com/espressif/esp-idf.git "$HOME/esp-idf"
-          cd "$HOME/esp-idf"
-          ./install.sh esp32c6
-
-      # esp-matter is too big to cache on GitHub's free per-repo budget — a
-      # full recursive clone lands around 28-38 GB (mostly third_party + git
-      # history), well over the 10 GB cache limit. Shallow-clone everything
-      # instead; that's the part that was actually slow about a full install
-      # anyway. Total install drops from ~20 min to ~4-5 min for the clone
-      # plus the usual install.sh runtime.
-      - name: Check out esp-matter (shallow)
-        shell: bash
-        run: |
-          mkdir -p "$HOME/esp-matter"
-          cd "$HOME/esp-matter"
-          git init --quiet
-          git remote add origin https://github.com/espressif/esp-matter.git
-          git fetch --depth=1 origin "$ESP_MATTER_REF"
-          git checkout FETCH_HEAD
-          git submodule update --init --recursive --depth=1
-
-      - name: Install esp-matter dependencies
-        shell: bash
-        run: |
-          export IDF_PATH="$HOME/esp-idf"
-          source "$IDF_PATH/export.sh" >/dev/null
-
-          # Strip `bluezoo` from connectedhomeip's pip requirements. It's a
-          # BlueZ mock for host-side tests (we pass --no-host-tool anyway), and
-          # recent PyPI releases pull in transitive deps that conflict with
-          # other CHIP-pinned packages, breaking pip-tools compile. This is
-          # purely a CI workaround; local installs that already cached a
-          # working bluezoo continue to work.
-          chip="$HOME/esp-matter/connectedhomeip/connectedhomeip"
-          for f in "$chip"/scripts/setup/requirements.build.txt \
-                   "$chip"/scripts/setup/requirements.txt \
-                   "$chip"/scripts/setup/constraints.txt \
-                   "$chip"/scripts/tests/requirements.txt; do
-            if [ -f "$f" ]; then
-              sed -i '/^[[:space:]]*bluezoo/d; /via bluezoo/d' "$f"
-            fi
-          done
-
-          cd "$HOME/esp-matter"
-          ./install.sh --no-host-tool
-
-      - name: Export build environment
-        shell: bash
-        run: |
-          CHIP_ROOT="$HOME/esp-matter/connectedhomeip/connectedhomeip"
-          {
-            echo "IDF_PATH=$HOME/esp-idf"
-            echo "ESP_MATTER_PATH=$HOME/esp-matter"
-            echo "CHIP_ROOT=$CHIP_ROOT"
-            echo "PW_PROJECT_ROOT=$CHIP_ROOT"
-            echo "PW_ROOT=$CHIP_ROOT/third_party/pigweed/repo"
-          } >> "$GITHUB_ENV"
-          echo "$CHIP_ROOT/.environment/cipd/packages/pigweed" >> "$GITHUB_PATH"
+      # No actions/setup-python here: this job runs inside the builder image,
+      # which already ships ESP-IDF's Python and virtualenv. A different Python
+      # shadows it on PATH, so export.sh computes the wrong idf<ver>_py<X>_env
+      # name and fails. The steps below use the image's own python3.
 
       - name: Build firmware
         shell: bash
         run: |
-          source "$IDF_PATH/export.sh" >/dev/null
+          # The builder image bakes ESP-IDF + esp-matter. Source IDF's
+          # export.sh for idf.py/toolchain, then esp-matter's export.sh to
+          # activate the CHIP/pigweed environment (this generates/locates
+          # build_overrides/pigweed_environment.gni, which the CHIP gn build
+          # needs — baked env vars alone are not enough).
+          . "$IDF_PATH/export.sh" >/dev/null
+          . "$ESP_MATTER_PATH/export.sh" >/dev/null
           cd "$GITHUB_WORKSPACE"
           idf.py set-target esp32c6 build
+          grep -q '^CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y$' sdkconfig
+          grep -q '^CONFIG_APP_OTA_SIG_VERIFY=y$' sdkconfig
+
+      - name: Verify signing key present when OTA verify enabled
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -q '^CONFIG_APP_OTA_SIG_VERIFY=y$' sdkconfig; then
+            if ! grep -q -- '-----BEGIN PUBLIC KEY-----' main/include/release_pubkey.h; then
+              echo "CONFIG_APP_OTA_SIG_VERIFY=y but main/include/release_pubkey.h has no PEM public key" >&2
+              exit 1
+            fi
+          fi
+
+      - name: Check sdkconfig drift
+        shell: bash
+        run: |
+          # NON-FAILING: sdkconfig is tracked, but a build can regenerate it with
+          # drift we cannot reconcile here (there is no clean local baseline build
+          # in CI). Emit a warning annotation only. Promote this to a hard failure
+          # (exit 1) once sdkconfig is reconciled against a clean build.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
+          if ! git diff --quiet -- sdkconfig; then
+            git diff --stat -- sdkconfig || true
+            echo "::warning::sdkconfig drifted during build; reconcile and commit the regenerated sdkconfig"
+          fi
+
+      - name: Validate release version
+        if: github.event_name == 'release'
+        id: release-metadata
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          test -s build/project_description.json
+          app_version="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["project_version"])' build/project_description.json)"
+          release_version="${RELEASE_TAG#v}"
+          if [[ -z "$app_version" || "$release_version" != "$app_version" ]]; then
+            echo "Release tag $RELEASE_TAG does not match built app version $app_version" >&2
+            exit 1
+          fi
+          echo "version=$app_version" >> "$GITHUB_OUTPUT"
 
       - name: Generate signed manifest
         if: github.event_name == 'release'
@@ -127,19 +121,92 @@ jobs:
           IDF_REF: ${{ env.IDF_VERSION }}
           MATTER_REF: ${{ env.ESP_MATTER_REF }}
           APP_BIN: build/${{ env.FIRMWARE_ASSET_NAME }}
+          APP_VERSION: ${{ steps.release-metadata.outputs.version }}
           SIGNING_KEY_PEM: ${{ secrets.MANIFEST_SIGNING_KEY }}
+          ROLLOUT_PERCENT: ${{ github.event.inputs.rollout_percent || '100' }}
         run: |
           chmod +x scripts/generate-manifest.sh
           scripts/generate-manifest.sh
 
+      - name: Verify release bundle
+        if: github.event_name == 'release'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          REPO_SLUG: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          for artifact in \
+            "build/$FIRMWARE_ASSET_NAME" \
+            "build/bootloader/$BOOTLOADER_ASSET_NAME" \
+            "build/partition_table/$PARTITION_TABLE_ASSET_NAME" \
+            "build/$OTA_DATA_INITIAL_ASSET_NAME" \
+            "$MANIFEST_ASSET_NAME" \
+            "$MANIFEST_SIG_ASSET_NAME"; do
+            test -s "$artifact" || { echo "Missing or empty release artifact: $artifact" >&2; exit 1; }
+          done
+
+          pubkey_file="$(mktemp)"
+          trap 'rm -f "$pubkey_file"' EXIT
+          python3 - "$pubkey_file" "$RELEASE_TAG" "$REPO_SLUG" "$FIRMWARE_ASSET_NAME" <<'PY'
+          import ast
+          import hashlib
+          import json
+          import sys
+          from pathlib import Path
+
+          pubkey_file, release_tag, repo_slug, asset_name = sys.argv[1:]
+          release_version = release_tag.removeprefix("v")
+          manifest_path = Path("manifest.json")
+          app_path = Path("build") / asset_name
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+          if manifest.get("version") != release_version:
+              raise SystemExit(f"manifest version {manifest.get('version')!r} != release version {release_version!r}")
+          if manifest.get("chip") != "esp32c6":
+              raise SystemExit("manifest chip is not esp32c6")
+          for field in ("idf_ref", "matter_ref"):
+              if not isinstance(manifest.get(field), str) or not manifest[field]:
+                  raise SystemExit(f"manifest field {field!r} is missing")
+
+          app = manifest.get("app")
+          if not isinstance(app, dict):
+              raise SystemExit("manifest app object is missing")
+          expected_url = f"https://github.com/{repo_slug}/releases/download/{release_tag}/{asset_name}"
+          if app.get("url") != expected_url:
+              raise SystemExit(f"manifest URL {app.get('url')!r} != expected URL {expected_url!r}")
+          actual_sha256 = hashlib.sha256(app_path.read_bytes()).hexdigest()
+          if app.get("sha256") != actual_sha256:
+              raise SystemExit("manifest SHA-256 does not match the published application image")
+          if app.get("size") != app_path.stat().st_size:
+              raise SystemExit("manifest size does not match the published application image")
+
+          rollout = manifest.get("rollout")
+          if not isinstance(rollout, dict) or not isinstance(rollout.get("percent"), int) or not 0 <= rollout["percent"] <= 100:
+              raise SystemExit("manifest rollout.percent must be an integer from 0 through 100")
+
+          pem_parts = []
+          for raw_line in Path("main/include/release_pubkey.h").read_text(encoding="utf-8").splitlines():
+              line = raw_line.strip().rstrip(";")
+              if line.startswith('"'):
+                  pem_parts.append(ast.literal_eval(line))
+          pem = "".join(pem_parts)
+          if not pem.startswith("-----BEGIN PUBLIC KEY-----\n") or not pem.endswith("-----END PUBLIC KEY-----\n"):
+              raise SystemExit("could not extract a PEM public key from main/include/release_pubkey.h")
+          Path(pubkey_file).write_text(pem, encoding="ascii", newline="")
+          PY
+          openssl dgst -sha256 -verify "$pubkey_file" \
+            -signature "$MANIFEST_SIG_ASSET_NAME" "$MANIFEST_ASSET_NAME"
+
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: esp32c6-led-web-firmware
           path: |
             build/esp32c6_led_web.bin
             build/bootloader/bootloader.bin
             build/partition_table/partition-table.bin
+            build/ota_data_initial.bin
             build/project_description.json
             manifest.json
             manifest.json.sig
@@ -158,10 +225,90 @@ jobs:
           # Bootloader + partition table for first-time USB flashing.
           gh release upload "$RELEASE_TAG" \
             "build/bootloader/$BOOTLOADER_ASSET_NAME" \
-            "build/partition_table/$PARTITION_TABLE_ASSET_NAME" --clobber || true
+            "build/partition_table/$PARTITION_TABLE_ASSET_NAME" --clobber
+
+          # ota_data_initial is required for a complete first-time USB flash.
+          gh release upload "$RELEASE_TAG" \
+            "build/$OTA_DATA_INITIAL_ASSET_NAME" --clobber
 
           # Signed manifest (devices fetch via /releases/latest/download/manifest.json).
           gh release upload "$RELEASE_TAG" "$MANIFEST_ASSET_NAME" --clobber
-          if [ -f "$MANIFEST_SIG_ASSET_NAME" ]; then
-            gh release upload "$RELEASE_TAG" "$MANIFEST_SIG_ASSET_NAME" --clobber
-          fi
+          test -s "$MANIFEST_SIG_ASSET_NAME"
+          gh release upload "$RELEASE_TAG" "$MANIFEST_SIG_ASSET_NAME" --clobber
+
+      - name: Verify published release
+        if: github.event_name == 'release'
+        shell: bash
+        env:
+          REPO_SLUG: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Re-fetch the ACTUAL published assets the fleet will download and
+          # re-verify them end to end. This catches a broken publish (404s,
+          # truncated blobs, a stale manifest/sig pairing) that the pre-upload
+          # "Verify release bundle" step cannot see.
+          workdir="$(mktemp -d)"
+          trap 'rm -rf "$workdir"' EXIT
+          base="https://github.com/$REPO_SLUG/releases/latest/download"
+
+          fetch() {
+            local url="$1" out="$2" attempt
+            for attempt in 1 2 3 4 5; do
+              if curl --fail --location --silent --show-error --output "$out" "$url"; then
+                return 0
+              fi
+              echo "Attempt $attempt failed for $url; retrying in 15s (release/latest may still be propagating)..." >&2
+              sleep 15
+            done
+            return 1
+          }
+
+          for asset in "$MANIFEST_ASSET_NAME" "$MANIFEST_SIG_ASSET_NAME" "$FIRMWARE_ASSET_NAME"; do
+            echo "Fetching published asset: $asset"
+            fetch "$base/$asset" "$workdir/$asset" \
+              || { echo "Could not download published asset: $asset" >&2; exit 1; }
+            test -s "$workdir/$asset" \
+              || { echo "Published asset empty or missing: $asset" >&2; exit 1; }
+          done
+
+          pubkey_file="$workdir/release_pubkey.pem"
+          python3 - "$pubkey_file" <<'PY'
+          import ast
+          import sys
+          from pathlib import Path
+
+          pubkey_file = sys.argv[1]
+          pem_parts = []
+          for raw_line in Path("main/include/release_pubkey.h").read_text(encoding="utf-8").splitlines():
+              line = raw_line.strip().rstrip(";")
+              if line.startswith('"'):
+                  pem_parts.append(ast.literal_eval(line))
+          pem = "".join(pem_parts)
+          if not pem.startswith("-----BEGIN PUBLIC KEY-----\n") or not pem.endswith("-----END PUBLIC KEY-----\n"):
+              raise SystemExit("could not extract a PEM public key from main/include/release_pubkey.h")
+          Path(pubkey_file).write_text(pem, encoding="ascii", newline="")
+          PY
+
+          # 1) Detached signature of the PUBLISHED manifest must verify.
+          openssl dgst -sha256 -verify "$pubkey_file" \
+            -signature "$workdir/$MANIFEST_SIG_ASSET_NAME" "$workdir/$MANIFEST_ASSET_NAME"
+
+          # 2) sha256(published bin) must equal the PUBLISHED manifest.app.sha256.
+          python3 - "$workdir" "$FIRMWARE_ASSET_NAME" "$MANIFEST_ASSET_NAME" <<'PY'
+          import hashlib
+          import json
+          import sys
+          from pathlib import Path
+
+          workdir, asset_name, manifest_name = sys.argv[1:]
+          manifest = json.loads((Path(workdir) / manifest_name).read_text(encoding="utf-8"))
+          app = manifest.get("app")
+          if not isinstance(app, dict):
+              raise SystemExit("published manifest app object is missing")
+          actual = hashlib.sha256((Path(workdir) / asset_name).read_bytes()).hexdigest()
+          if app.get("sha256") != actual:
+              raise SystemExit(
+                  f"published bin sha256 {actual!r} != manifest.app.sha256 {app.get('sha256')!r}"
+              )
+          print("Published release verified: signature OK and sha256 matches manifest.")
+          PY

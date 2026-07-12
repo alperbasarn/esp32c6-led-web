@@ -1,0 +1,87 @@
+# Kill-switch for a bad release.
+#
+# This workflow HALTS an already-published release by re-generating its OTA
+# manifest with rollout percent 0 (by default) and re-uploading it. Devices
+# read /releases/latest/download/manifest.json and honour rollout.percent, so
+# once the halted manifest is live, in-cohort devices stop installing the bad
+# build.
+#
+# It re-signs and re-uploads ONLY the manifest (manifest.json + manifest.json.sig).
+# The firmware binary (esp32c6_led_web.bin) is left untouched — we download the
+# release's existing .bin purely so the regenerated manifest keeps the correct
+# sha256/size/url for that asset.
+#
+# Run it from the Actions tab: provide the release tag (e.g. v1.7) and,
+# optionally, a non-zero percent to partially re-open a rollout instead of a
+# full stop.
+name: Halt Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to halt (e.g. v1.7)"
+        required: true
+        type: string
+      percent:
+        description: "Rollout percent to publish (0 halts the release)"
+        required: false
+        default: "0"
+        type: string
+
+env:
+  IDF_VERSION: v5.4.1
+  ESP_MATTER_REF: c6f767254f6267e057916981646a44c65d034254
+  FIRMWARE_ASSET_NAME: esp32c6_led_web.bin
+  MANIFEST_ASSET_NAME: manifest.json
+  MANIFEST_SIG_ASSET_NAME: manifest.json.sig
+
+jobs:
+  halt:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v5
+
+      - name: Download the release's current firmware binary
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release download "$RELEASE_TAG" \
+            --pattern "$FIRMWARE_ASSET_NAME" \
+            --dir build \
+            --clobber
+          test -s "build/$FIRMWARE_ASSET_NAME"
+
+      - name: Regenerate signed manifest with the requested rollout
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          REPO_SLUG: ${{ github.repository }}
+          IDF_REF: ${{ env.IDF_VERSION }}
+          MATTER_REF: ${{ env.ESP_MATTER_REF }}
+          APP_BIN: build/${{ env.FIRMWARE_ASSET_NAME }}
+          ROLLOUT_PERCENT: ${{ inputs.percent }}
+          SIGNING_KEY_PEM: ${{ secrets.MANIFEST_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          chmod +x scripts/generate-manifest.sh
+          scripts/generate-manifest.sh
+
+      - name: Re-upload the halted manifest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          test -s "$MANIFEST_ASSET_NAME"
+          test -s "$MANIFEST_SIG_ASSET_NAME"
+          gh release upload "$RELEASE_TAG" \
+            "$MANIFEST_ASSET_NAME" "$MANIFEST_SIG_ASSET_NAME" --clobber
