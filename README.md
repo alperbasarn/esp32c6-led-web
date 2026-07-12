@@ -52,20 +52,6 @@ idf.py -p COM6 flash monitor                  # Windows
 
 **The first install needs a USB flash.** After that, the device can pull new firmware over the air — either by uploading a `.bin` you built locally (Configuration → Install From File) or, more usually, by waiting for the next published GitHub release and pressing Install Update.
 
-### How CI builds the firmware
-
-CI does not install the toolchain from scratch on every run. Instead it builds inside a prebuilt container image, `ghcr.io/alperbasarn/esp32c6-matter-builder`, tagged `idf-v5.4.1-matter-c6f7672` (tag scheme: `idf-<IDF_VERSION>-matter-<short-sha>`). That image bundles ESP-IDF `v5.4.1` and esp-matter at the pinned commit, and is produced by [`.github/workflows/build-builder-image.yml`](.github/workflows/build-builder-image.yml).
-
-Upgrading ESP-IDF or esp-matter is therefore a three-step change:
-
-1. Bump `IDF_VERSION` / `ESP_MATTER_REF` (the pinned versions).
-2. Rebuild the builder image so it publishes a **new tag** (`idf-<new-idf>-matter-<new-short-sha>`).
-3. Update the container ref in [`.github/workflows/publish-firmware.yml`](.github/workflows/publish-firmware.yml) to point at that new tag.
-
-One-time setup: the GHCR package must be pullable by CI. Either make the `esp32c6-matter-builder` package public, or grant `packages: read` so the workflow's `GITHUB_TOKEN` can pull it.
-
-Pull requests now build the firmware and assert the safety config flags before a merge is allowed, so a change that breaks the build or flips a safety flag is caught at PR time rather than at release time.
-
 For first-time USB flash, the CI workflow publishes `bootloader.bin`, `partition-table.bin`, `ota_data_initial.bin`, and `esp32c6_led_web.bin` to every GitHub release. You can flash all four with esptool directly without a local toolchain:
 
 ```bash
@@ -159,9 +145,9 @@ Each release publishes a signed `manifest.json` to the GitHub release. The devic
 
 1. Fetches `https://github.com/<repo>/releases/latest/download/manifest.json`.
 2. Fetches `manifest.json.sig` (detached ECDSA P-256 DER signature over the manifest bytes).
-3. Verifies the signature against the public key embedded in [`main/include/release_pubkey.h`](main/include/release_pubkey.h). Rejects the release if the signature is missing or invalid. Building with `CONFIG_APP_OTA_SIG_VERIFY=y` but an empty embedded public key now fails at **compile time**, and at runtime a device configured to verify but left without a key refuses updates instead of silently skipping the check.
+3. Verifies the signature against the public key embedded in [`main/include/release_pubkey.h`](main/include/release_pubkey.h). Rejects the release if the signature is missing or invalid.
 4. Compares `manifest.version` against the running firmware. Skips if not newer.
-5. Cohort-gates: a stable hash of the device MAC % 100 must be less than `manifest.rollout.percent`. Devices outside the cohort surface an "available, waiting" status without installing. The rollout percent is now a real, controllable gate (see [Publishing a release](#publishing-a-release)) rather than an always-100 constant — setting it to `0` stops every in-cohort device from installing.
+5. Cohort-gates: a stable hash of the device MAC % 100 must be less than `manifest.rollout.percent`. Devices outside the cohort surface an "available, waiting" status without installing.
 6. Downloads the binary via `esp_https_ota`, then reads the freshly written OTA partition back and compares its SHA-256 against `manifest.app.sha256`. On mismatch the boot partition is reverted before reboot.
 7. After reboot, an early-boot probation step writes a strike counter to NVS (`ota_health` namespace) and neutralizes the bootloader's built-in 1-strike rollback by calling `esp_ota_mark_app_valid_cancel_rollback()`. We're now in charge of probation.
 8. A `self_test_task` waits up to `CONFIG_APP_UPDATE_SELF_TEST_TIMEOUT_S` (default 90 s) for **both Wi-Fi STA up AND Matter ready**. On success it clears the NVS marker — the image is permanent. On timeout it `esp_restart()`s; the next boot increments the strike count.
@@ -194,15 +180,9 @@ To cut a release:
 
 Before release upload, CI also checks that every artifact is non-empty, the manifest hash/size/URL match the exact application image, and the detached signature verifies against the public key embedded in the firmware source.
 
-After the upload, CI re-fetches the actually-published `/releases/latest/download/{manifest.json,manifest.json.sig,esp32c6_led_web.bin}` and re-runs the full verification end-to-end: it checks the detached signature against the public key in [`main/include/release_pubkey.h`](main/include/release_pubkey.h) and the binary's SHA-256 against `manifest.app.sha256`. A publish that uploaded a mismatched, truncated, or wrongly-signed asset therefore fails loudly rather than shipping a release devices will reject.
+Pinned versions live in workflow env (`IDF_VERSION`, `ESP_MATTER_REF`). If you upgrade the Matter stack or IDF, bump them in [`.github/workflows/publish-firmware.yml`](.github/workflows/publish-firmware.yml) so CI matches what you build locally.
 
-**Staged rollout.** The rollout percent written into `manifest.rollout.percent` comes from a `ROLLOUT_PERCENT` value (integer `0..100`, default `100`) that the publish workflow supplies to [`scripts/generate-manifest.sh`](scripts/generate-manifest.sh). Run the workflow via `workflow_dispatch` and set the rollout input to ship a new release to only a fraction of the fleet first; leaving it unset ships to everyone.
-
-**Halting a bad release.** If a published release turns out to be broken, run the `Halt Release` workflow. It re-generates the manifest for the same release with rollout percent `0`, re-signs it, and re-uploads `manifest.json` + `manifest.json.sig`. The binary itself is unchanged — only the manifest changes — so in-cohort devices that have not yet installed stop installing it on their next check. This is what makes the cohort rollout an operational lever instead of an inert field.
-
-Pinned versions live in workflow env (`IDF_VERSION`, `ESP_MATTER_REF`). If you upgrade the Matter stack or IDF, bump them in [`.github/workflows/publish-firmware.yml`](.github/workflows/publish-firmware.yml) so CI matches what you build locally, then rebuild and re-point the builder image as described in [How CI builds the firmware](#how-ci-builds-the-firmware).
-
-Because the release build runs inside the prebuilt `ghcr.io/alperbasarn/esp32c6-matter-builder` image, ESP-IDF and esp-matter are already baked in and are not re-cloned or re-cached per release — the toolchain arrives with the container.
+ESP-IDF is cached in CI under the `main` branch scope (no per-tag re-clone). esp-matter is shallow-cloned each run because a full recursive clone exceeds GitHub's 10 GB per-repo cache budget; shallow clone takes ~10 min per release. Total release CI runtime: ~20 min.
 
 ### Signing key management
 
