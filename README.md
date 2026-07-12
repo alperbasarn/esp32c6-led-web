@@ -15,7 +15,7 @@ It exposes the strip in two ways:
 
 The firmware starts a Wi-Fi SoftAP, serves the control page directly from the board, and includes captive-portal style redirects plus a small DNS responder so phones and laptops are more likely to open the page automatically. After the device joins your normal Wi-Fi through Matter commissioning, the same web UI is also reachable on its LAN IP.
 
-Maintainer-oriented runtime ownership and update-flow notes are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+Maintainer-oriented runtime ownership and update-flow notes are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). CI build timings and speed-up options (including the self-hosted-runner trade-offs) are in [`docs/ci-performance.md`](docs/ci-performance.md).
 
 ## Defaults
 
