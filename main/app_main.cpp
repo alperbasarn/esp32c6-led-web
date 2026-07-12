@@ -2821,7 +2821,10 @@ static void schedule_task(void *arg)
 {
     (void) arg;
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(10000));
+        // Tick every second so the relative timer fires within ~1 s of its
+        // deadline (matching the UI countdown) instead of lagging up to the old
+        // 10 s poll interval. Wall-clock schedules still de-dupe per minute.
+        vTaskDelay(pdMS_TO_TICKS(1000));
 
         // Relative one-shot timer (monotonic; survives without time sync).
         bool relative_fire = false;
