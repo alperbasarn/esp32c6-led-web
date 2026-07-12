@@ -17,8 +17,8 @@ and [`docker/builder.Dockerfile`](../docker/builder.Dockerfile).
 | Stage | Old (clone-based) | Current (container) |
 |-------|-------------------|---------------------|
 | esp-matter checkout + install | ~11 min | — (baked in image) |
-| Image pull ("Initialize containers") | — | **~7.6 min** |
-| Compile ("Build firmware") | ~7 min | **~6 min** |
+| Image pull ("Initialize containers") | — | **~7.6 min** (457 s) |
+| Compile ("Build firmware") | ~7 min | **~6 min** (369 s) |
 | **Total release build** | **~18 min** | **~14 min** |
 
 The container migration removed the fragile per-build clone but **moved** the cost
@@ -26,7 +26,7 @@ into the image pull — the image is multi-GB and GitHub runners are ephemeral, 
 it is re-downloaded and re-decompressed every run. So the two remaining costs are:
 
 1. **Image pull (~7.6 min)** — dominated by gzip decompression (effectively
-   single-threaded) of a multi-GB toolchain image.
+   single-threaded) of a multi-GB toolchain image. **This is the bottleneck.**
 2. **Compile (~6 min)** — almost entirely esp-matter/CHIP C++, which rarely changes.
 
 ## Optimizations already applied
@@ -39,31 +39,46 @@ it is re-downloaded and re-decompressed every run. So the two remaining costs ar
 - **Single build per release** — dropped the `push: main` trigger, which used to
   build the same commit twice (version-bump push + tag).
 
-## In-progress experiment: `ci/builder-image-speedup` branch
+## Experiment results: `ci/builder-image-speedup` branch (didn't help — unmerged)
 
-Two changes under validation on that branch (isolated behind a `:dev` image tag so
-releases are untouched):
+Two "free" levers were built and measured on that branch, isolated behind a `:dev`
+image tag so releases were untouched. **Confirmed on a clean `:dev` build:**
 
-- **ccache** — `ccache` installed in the image, `IDF_CCACHE_ENABLE=1`, and
-  `CCACHE_DIR` persisted across runs via `actions/cache`. esp-matter/CHIP objects
-  rarely change, so a warm cache should cut the ~6 min compile to **~1–2 min**.
-  *(Warm-run measurement pending.)*
-- **Image prune** — remove `__pycache__` / pip caches from the install layer.
-  Preliminary: pull dropped to **~1.6 min** (from ~7.6 min) — larger than expected;
-  being confirmed.
+| Stage | Production | `:dev` (prune + ccache, cold) |
+|-------|-----------|-------------------------------|
+| Image pull | ~7.6 min (457 s) | **~7.9 min (475 s)** — no change |
+| Compile | ~6.2 min (369 s) | **~8.7 min (520 s)** — *slower* |
 
-If both hold up, a release build would land around **~4–6 min** on GitHub-hosted
-runners. Merge to `main` restores the production image tags in these two files.
+Findings:
 
-## Reducing the image fetch further
+- **The prune was ineffective.** Removing `__pycache__` / pip caches did not shrink
+  a multi-GB toolchain image; the pull is unchanged. (An earlier "~1.6 min" reading
+  was an artifact of a build cancelled mid-pull, not a real result.) Meaningful pull
+  reduction needs **zstd** and/or deeper multi-stage surgery — not cache trimming.
+- **ccache is a net loss on a *cold* cache.** On a miss, ccache adds hashing/store
+  overhead, so the cold compile was *slower* than no ccache (8.7 vs 6.2 min). It
+  only pays off warm — and via `actions/cache` the cache evicts after 7 days of no
+  use, so an infrequent release path would usually run cold and take the penalty.
+  ccache helps a frequent PR loop but can *hurt* infrequent releases unless the
+  cache is kept warm (frequent builds, an in-image warm cache, or a persistent
+  runner). The warm-run compile was not measured.
+
+**Conclusion:** neither free lever moved the release wall-clock — the ~7.9 min
+**pull is the bottleneck** and is unaddressed by prune or ccache. The branch is left
+**unmerged**. Revisit only with the levers below.
+
+## Reducing the image fetch (the actual bottleneck)
 
 On GitHub-hosted runners the pull is structural (fresh machine every run):
 
-- **zstd layer compression** (free, not yet applied) — `compression=zstd` in the
-  image build; zstd decompresses far faster than gzip → ~30–50% faster pull.
-- **Deeper prune / multi-stage** — diminishing returns and some risk (the CHIP
-  build occasionally queries git metadata, so dropping `.git` is not free).
-- **Floor** on hosted runners with all of the above: ~3–4 min pull. Not zero.
+- **zstd layer compression** (free, untried — the clear next step) — `compression=zstd`
+  in the image build; zstd decompresses far faster than gzip → ~30–50% faster pull.
+- **Deeper prune / multi-stage** — uncertain payoff and some risk (the CHIP build
+  occasionally queries git metadata, so dropping `.git` is not free).
+- **Floor** on hosted runners with the above: ~3–4 min pull. Not zero.
+
+The structural fix — a **persistent image/layer cache** — needs a self-hosted or
+cache-persistent paid runner (below).
 
 ## Self-hosted runner (PC now, Raspberry Pi later)
 
@@ -115,8 +130,12 @@ Realistic outcome: **~14 min → ~2–4 min**, most of which is just the compile
 
 ## Recommendation / decision log
 
-- **Now:** land the `ccache` + `prune` experiment (biggest free wins) and add zstd.
-- **Self-hosted PC / RPi migration:** **parked** (2026-07). If revisited, prefer a
-  cheap dedicated VPS over a personal machine, with fork-PR approval on and the
-  signing job kept on GitHub-hosted. Skip the RPi for this pipeline (arm64 +
-  slow compile).
+- The ~14 min release build is **pull-bound (~7.9 min)**. The two free levers tried
+  (image prune, ccache) did **not** help release wall-clock — see above.
+  `ci/builder-image-speedup` is left **unmerged**.
+- **Best remaining free lever: zstd layer compression** on the image (~30–50%
+  faster pull). Untried; the clear next step if revisited.
+- **The structural fix is a persistent image/layer cache** — a self-hosted or
+  cache-persistent paid runner. **Parked (2026-07.)** If revisited, prefer a cheap
+  dedicated VPS over a personal machine, with fork-PR approval on and the signing
+  job kept on GitHub-hosted. **Skip the RPi** for this pipeline (arm64 + slow compile).
