@@ -38,7 +38,9 @@ jobs:
     # toolchain install/cache steps are gone. `credentials` lets the runner pull
     # the (private) image from GHCR.
     container:
-      image: ghcr.io/alperbasarn/esp32c6-matter-builder:idf-v5.4.1-matter-c6f7672
+      # DEV branch: use the experimental :dev image (ccache + prune). Restore the
+      # pinned production tag on merge to main.
+      image: ghcr.io/alperbasarn/esp32c6-matter-builder:dev
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -50,6 +52,17 @@ jobs:
       - name: Checkout project
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
+      # Persist ccache across runs so esp-matter/CHIP objects (the bulk of the
+      # ~6 min compile, and rarely changed) are reused. IDF_CCACHE_ENABLE is set
+      # in the builder image; CCACHE_DIR (on the build step) points ccache here.
+      - name: Restore ccache
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: .ccache
+          key: ccache-esp32c6-${{ github.sha }}
+          restore-keys: |
+            ccache-esp32c6-
+
       # No actions/setup-python here: this job runs inside the builder image,
       # which already ships ESP-IDF's Python and virtualenv. A different Python
       # shadows it on PATH, so export.sh computes the wrong idf<ver>_py<X>_env
@@ -57,6 +70,8 @@ jobs:
 
       - name: Build firmware
         shell: bash
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
         run: |
           # The builder image bakes ESP-IDF + esp-matter. Source IDF's
           # export.sh for idf.py/toolchain, then esp-matter's export.sh to
@@ -69,6 +84,7 @@ jobs:
           idf.py set-target esp32c6 build
           grep -q '^CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y$' sdkconfig
           grep -q '^CONFIG_APP_OTA_SIG_VERIFY=y$' sdkconfig
+          ccache -s || true   # hit-rate telemetry for the ccache experiment
 
       - name: Verify signing key present when OTA verify enabled
         shell: bash

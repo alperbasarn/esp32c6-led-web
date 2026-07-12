@@ -18,7 +18,7 @@ ENV ESP_MATTER_PATH=/opt/esp-matter
 # headers/toolchain they need; the fat GitHub runner has them preinstalled,
 # which is why the clone-based workflow never hit this. Install them first.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential pkg-config python3-dev libffi-dev libssl-dev \
+        build-essential pkg-config python3-dev libffi-dev libssl-dev ccache \
     && rm -rf /var/lib/apt/lists/*
 
 # Shallow-fetch esp-matter at the pinned SHA, then shallow-init submodules. A
@@ -57,7 +57,12 @@ RUN set -eux; \
     export IDF_PATH_FORCE=1; \
     . "$IDF_PATH/export.sh" >/dev/null; \
     cd "$ESP_MATTER_PATH"; \
-    ./install.sh --no-host-tool
+    ./install.sh --no-host-tool; \
+    # Prune install cruft to shrink the image (and thus the CI pull). Only
+    # regenerable caches -- the esp_matter component, connectedhomeip source,
+    # pigweed/CIPD toolchain, and venvs are kept.
+    find "$ESP_MATTER_PATH" -type d -name '__pycache__' -prune -exec rm -rf {} + ; \
+    rm -rf /root/.cache/pip /tmp/* 2>/dev/null || true
 
 # Bake the build environment so the publish job needs no export step. These
 # mirror the "Export build environment" step of publish-firmware.yml.
@@ -65,3 +70,8 @@ ENV CHIP_ROOT=$ESP_MATTER_PATH/connectedhomeip/connectedhomeip
 ENV PW_PROJECT_ROOT=$CHIP_ROOT
 ENV PW_ROOT=$CHIP_ROOT/third_party/pigweed/repo
 ENV PATH=$CHIP_ROOT/.environment/cipd/packages/pigweed:$PATH
+
+# Turn on ccache so the publish job's compile reuses cached objects (the CI
+# workflow persists CCACHE_DIR across runs). esp-matter/CHIP is the bulk of the
+# ~6 min compile and rarely changes, so this is the biggest per-build saving.
+ENV IDF_CCACHE_ENABLE=1

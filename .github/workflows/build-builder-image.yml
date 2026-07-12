@@ -49,8 +49,10 @@ jobs:
           # Registry-backed layer cache so rebuilds reuse the expensive
           # esp-matter clone/install layer instead of re-fetching it (~15 min).
           # Stored in GHCR, so the 10 GB Actions-cache limit does not apply.
-          cache-from: type=registry,ref=ghcr.io/alperbasarn/esp32c6-matter-builder:buildcache
-          cache-to: type=registry,ref=ghcr.io/alperbasarn/esp32c6-matter-builder:buildcache,mode=max
+          cache-from: type=registry,ref=ghcr.io/alperbasarn/esp32c6-matter-builder:buildcache-dev
+          cache-to: type=registry,ref=ghcr.io/alperbasarn/esp32c6-matter-builder:buildcache-dev,mode=max
+          # DEV-branch tag only, so the ccache/prune experiment never overwrites
+          # the production image used by releases. Restore the production tags on
+          # merge to main.
           tags: |
-            ghcr.io/alperbasarn/esp32c6-matter-builder:idf-v5.4.1-matter-c6f7672
-            ghcr.io/alperbasarn/esp32c6-matter-builder:latest
+            ghcr.io/alperbasarn/esp32c6-matter-builder:dev
