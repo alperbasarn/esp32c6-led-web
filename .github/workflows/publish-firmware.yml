@@ -4,13 +4,12 @@ on:
   release:
     types:
       - published
-  # Build (and run the config guards) on PRs and pushes to main as a CI gate.
-  # The builder image bakes in ESP-IDF + esp-matter, so no cache priming step is
-  # needed. Release-only steps self-skip via `if: github.event_name == 'release'`.
+  # Build (and run the config guards) on PRs as a CI gate. The builder image
+  # bakes in ESP-IDF + esp-matter, so there is no cache to prime -- and we do
+  # NOT build on plain main pushes, because a release is a version-bump push to
+  # main followed by a tag, and both events firing this workflow built the same
+  # commit twice. Release-only steps self-skip via `if: github.event_name == 'release'`.
   pull_request:
-  push:
-    branches:
-      - main
   workflow_dispatch:
     inputs:
       rollout_percent:
