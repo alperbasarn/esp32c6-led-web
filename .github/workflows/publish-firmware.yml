@@ -59,9 +59,13 @@ jobs:
       - name: Build firmware
         shell: bash
         run: |
-          # The builder image provides IDF_PATH and the esp-matter env vars;
-          # sourcing export.sh puts idf.py + the toolchain on PATH to be safe.
+          # The builder image bakes ESP-IDF + esp-matter. Source IDF's
+          # export.sh for idf.py/toolchain, then esp-matter's export.sh to
+          # activate the CHIP/pigweed environment (this generates/locates
+          # build_overrides/pigweed_environment.gni, which the CHIP gn build
+          # needs — baked env vars alone are not enough).
           . "$IDF_PATH/export.sh" >/dev/null
+          . "$ESP_MATTER_PATH/export.sh" >/dev/null
           cd "$GITHUB_WORKSPACE"
           idf.py set-target esp32c6 build
           grep -q '^CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y$' sdkconfig
