@@ -31,6 +31,20 @@ flowchart LR
 - The effect task is the only runtime renderer. It renders from a copied state
   snapshot, wakes on state changes, and does not hold `s_state_mutex` while
   touching the LED strip.
+- The effect task also owns a private "displayed" state (`s_disp_*`) that eases
+  brightness and per-channel color toward the target snapshot each frame
+  (exponential ease, `kEaseTauMs`; snaps within `kEaseEpsilon`). Only the effect
+  task touches these fields — the eased values are display-only and never feed
+  back into the canonical state or Matter. Power is derived from the eased
+  brightness so on/off fades run to true black.
+- Final output is gamma-corrected through `s_gamma_lut`, a 256-entry LUT built
+  once at boot by `init_gamma_lut()` (exponent `kGammaExponent`) before the
+  effect task starts. Gamma is applied last, per channel, folding effect
+  modulation and the eased brightness/color into a single pass.
+- The task's notify wait is transition-aware: it keeps rendering at ~40 ms while
+  the effect animates OR while an ease is still in flight, and blocks
+  indefinitely (`portMAX_DELAY`) only once both settled and non-animated. Any
+  control/Matter/schedule change calls `notify_effect_task()` to wake it.
 
 ## Update flows
 

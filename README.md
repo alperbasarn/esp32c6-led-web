@@ -10,7 +10,7 @@ It exposes the strip in two ways:
 - Periodic background checks against the latest published GitHub release; manual or automatic install with a signed-manifest verification chain
 - A firmware revert action that boots back into the other OTA slot
 - A factory reset action that clears Matter pairing, Wi-Fi AP config, and saved LED settings
-- Built-in LED effects: `glow`, `rainbow`, `chase`, `sparkle`, `wave`, plus a plain `Solid` color mode
+- Built-in LED effects: `glow`, `rainbow`, `chase`, `sparkle`, `wave`, `fire`, `aurora`, plus a plain `Solid` color mode
 - Per-effect controls in the web UI with unique meanings for each animation
 
 The firmware starts a Wi-Fi SoftAP, serves the control page directly from the board, and includes captive-portal style redirects plus a small DNS responder so phones and laptops are more likely to open the page automatically. After the device joins your normal Wi-Fi through Matter commissioning, the same web UI is also reachable on its LAN IP.
@@ -69,7 +69,7 @@ The device page is split into three tabs:
 
 - `Overview`: Matter state (including fabric count and commissioning-window status), a `Wi-Fi State` card (active AP SSID, station status/SSID, BSSID/channel, signal/RSSI, last disconnect reason, and an AP-restart-needed flag), AP and LAN web UI URLs, current firmware version, running slot, next OTA slot, revert target, latest available release, update status
 - `Configuration`: LED count, SoftAP SSID/password, a **Schedules** card and timezone field (see [Timers & schedules](#timers--schedules)), an **Install published updates automatically** toggle (default on), the Firmware Update card (Current vs. Available version, **Install Update** button, Check For Updates button, and a manual **Install From File** path), revert button, factory reset, reboot
-- `Control`: brightness, color, a sleep/wake timer (see [Timers & schedules](#timers--schedules)), and one sub-tab per mode — `Solid` (the default) plus the five animated effects — each with its own parameters
+- `Control`: brightness, color, a sleep/wake timer (see [Timers & schedules](#timers--schedules)), and one sub-tab per mode — `Solid` (the default) plus the seven animated effects — each with its own parameters. Brightness, color, and power changes are applied with a smooth eased ramp and gamma correction, so fades and on/off transitions look even and premium rather than steppy.
 
 The SoftAP SSID and password are the credentials hosted by the ESP32-C6 itself for the local setup page. On a fresh device they are generated automatically and printed to the serial log when the AP starts.
 
@@ -218,9 +218,11 @@ To bootstrap a fresh fork: generate a new keypair as above, replace the placehol
 - Each effect now has its own saved parameter set. Examples:
 - `glow`: pulse speed, glow floor, pulse depth
 - `rainbow`: drift speed, rainbow length, color blend, start offset, contrast
-- `chase`: chase speed, tail length, tail sharpness
-- `sparkle`: spark density, base glow, twinkle speed. Sparkle is the only effect with a dedicated per-effect color control (`Sparkle Color`, default white), shown as an extra swatch when the Sparkle tab is selected.
+- `chase`: chase speed, tail length, tail sharpness. The head moves at sub-pixel resolution with an anti-aliased leading edge and a power-shaped trailing tail, so the comet glides smoothly instead of jumping pixel to pixel.
+- `sparkle`: spark density, base glow, twinkle speed. Each pixel twinkles with its own random phase and rate for a livelier, crisper shimmer. Sparkle is the only effect with a dedicated per-effect color control (`Sparkle Color`, default white), shown as an extra swatch when the Sparkle tab is selected.
 - `wave`: wave speed, wavelength, wave depth
+- `fire`: cooling, sparking, flame speed, flame height, warmth. A scrolling two-octave heat field with sparse bright embers rendered through a black→red→orange→yellow→white flame palette.
+- `aurora`: drift speed, color scale, saturation, hue center, hue spread. Slow drifting hue field with gentle luminance breathing for a soft northern-lights wash; hue center and spread set the palette band, saturation blends toward white.
 - The LED count set in the page is clamped to the compiled-in maximum.
 - LED GPIO and maximum pixel count are build-time settings. Run `idf.py menuconfig`, navigate to **ESP32-C6 LED Web — Hardware**, and adjust `APP_LED_GPIO` / `APP_LED_MAX_PIXELS`, or edit `sdkconfig.defaults` (for example `CONFIG_APP_LED_GPIO=18`); then rebuild. Note that `sdkconfig` is checked into this repo, so a plain `idf.py build` uses the committed configuration. The default is GPIO 17, which is D7 on a XIAO ESP32C6.
 - The serial monitor is the most reliable place to get the first Matter pairing codes after boot.

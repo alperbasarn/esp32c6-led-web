@@ -7,6 +7,14 @@ CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 CONFIG_NEWLIB_NANO_FORMAT=y
 
+# Silence assertions in the release image. This keeps the abort-on-failure
+# safety net but drops the per-call __FILE__ / stringized-expression rodata that
+# IDF and esp-matter emit for every assert() -- pure strings that add up to
+# several KB across the CHIP stack. Reclaiming them keeps the full feature set
+# (now incl. gamma/eased transitions + fire/aurora effects) inside the 0x1F0000
+# OTA app partition. Switch to _DISABLE for more headroom; _SILENT keeps aborts.
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y
+
 # OTA rollback safety: bootloader marks a freshly flashed app as PENDING_VERIFY
 # and requires the app to call esp_ota_mark_app_valid_cancel_rollback() once
 # the self-test passes. Otherwise the next reboot rolls back to the previous slot.
