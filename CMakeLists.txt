@@ -4,8 +4,8 @@ if(NOT DEFINED ENV{ESP_MATTER_PATH})
     message(FATAL_ERROR "Please set ESP_MATTER_PATH to the path of esp-matter repo")
 endif()
 
-set(PROJECT_VER "1.10")
-set(PROJECT_VER_NUMBER 10)
+set(PROJECT_VER "1.11")
+set(PROJECT_VER_NUMBER 11)
 set(IDF_TARGET "esp32c6")
 
 set(ESP_MATTER_PATH $ENV{ESP_MATTER_PATH})
