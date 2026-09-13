@@ -161,6 +161,8 @@ So a broken release has three layers of defense:
 | Boots, but Wi-Fi/Matter never come up                  | self-test timeout (×2)   |
 | Panics or hangs the watchdog before self-test runs    | next boot's strike count |
 
+An image that boots in the bootloader's `PENDING_VERIFY` state **without** a matching probation marker — a USB/JTAG-flashed build, an already-promoted image, a stale marker referencing the other slot, or the rare case of a published OTA whose marker write was lost — is not under the 2-strike scheme. The early-boot probation step now confirms such an image with `esp_ota_mark_app_valid_cancel_rollback()` as soon as it is detected. Without this the running image would stay `PENDING_VERIFY` forever and every future `esp_ota_begin()` would fail with `ESP_ERR_OTA_ROLLBACK_INVALID_STATE`, permanently blocking OTA.
+
 Each device schedules its first poll with a random `[0, CONFIG_APP_UPDATE_INITIAL_JITTER_MIN]`-minute delay counted from boot. Getting a LAN IP (the `GOT_IP` event) wakes the update task and runs the first check immediately, so on a device that joins Wi-Fi the first on-network check effectively fires at Wi-Fi-up with no delay; the `[0, jitter]` delay only elapses if Wi-Fi never comes up. The `Check For Updates` button also bypasses the wait. When automatic installation is enabled, in-cohort devices install newer releases after the periodic check; when it is disabled, the device only reports the update and installation requires the `Install Update` button.
 
 ### Publishing a release

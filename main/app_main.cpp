@@ -1342,6 +1342,44 @@ static esp_err_t ota_health_write(const char *slot, const char *ver, uint8_t str
     return err;
 }
 
+// Confirm a *markerless* running image if the bootloader left it
+// PENDING_VERIFY. Such an image is NOT under our 2-strike probation: a
+// USB/JTAG bench flash, an image already promoted by a prior successful
+// self-test, a stale marker that references a different slot, or (rarely) a
+// published OTA whose probation-marker write was lost. With
+// CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y the bootloader leaves a freshly
+// booted image in ESP_OTA_IMG_PENDING_VERIFY, and the running app MUST confirm
+// itself via esp_ota_mark_app_valid_cancel_rollback() or (a) the bootloader
+// rolls it back on the next reset and (b) every later esp_ota_begin() fails
+// with ESP_ERR_OTA_ROLLBACK_INVALID_STATE — OTA is then permanently blocked.
+// Nothing else confirms these images (self_test_task never marks valid), so we
+// do it here. The image already passed SHA-256 and IDF image validation before
+// the bootloader jumped into it, so confirming is safe. We only ever act on a
+// PENDING_VERIFY image and never re-touch a VALID/UNDEFINED one; a failed state
+// read is a silent no-op.
+static void confirm_running_if_pending(const esp_partition_t *running)
+{
+    if (!running) {
+        return;
+    }
+    esp_ota_img_states_t st = ESP_OTA_IMG_UNDEFINED;
+    esp_err_t serr = esp_ota_get_state_partition(running, &st);
+    if (serr != ESP_OK) {
+        // Can't determine the otadata state — leave rollback state untouched.
+        ESP_LOGD(TAG, "OTA: esp_ota_get_state_partition(%s) failed: %s — "
+                      "leaving rollback state untouched",
+                 running->label, esp_err_to_name(serr));
+        return;
+    }
+    if (st != ESP_OTA_IMG_PENDING_VERIFY) {
+        return;  // already VALID/UNDEFINED/etc. — never touch a non-pending image
+    }
+    esp_err_t mv = esp_ota_mark_app_valid_cancel_rollback();
+    ESP_LOGI(TAG, "OTA: markerless image on %s was PENDING_VERIFY — confirmed "
+                  "valid to re-enable OTA (%s)",
+             running->label, esp_err_to_name(mv));
+}
+
 // Called very early in app_main, right after NVS init. Manages the
 // probationary boot lifecycle: if the running image is under probation,
 // either roll back (too many failed attempts), or increment the strike
@@ -1361,10 +1399,14 @@ static void init_ota_probation()
     esp_err_t err = ota_health_read(marker_slot, sizeof(marker_slot),
                                     marker_ver, sizeof(marker_ver), &strikes, &marker_manual);
     if (err == ESP_ERR_NVS_NOT_FOUND || marker_slot[0] == '\0') {
-        // No probation in progress — nothing to do. If the bootloader marked
-        // us PENDING_VERIFY anyway (e.g., first OTA from a previous firmware
-        // that didn't write a marker), fall back to default ROLLBACK_ENABLE
-        // behavior: the legacy self-test will mark us valid later.
+        // No probation marker for this boot: the image is not under our 2-strike
+        // probation (USB/JTAG flash, an image already promoted by a prior
+        // self-test, or a fresh OTA whose marker write was lost). We do NOT
+        // strike-count it. But if the bootloader left it PENDING_VERIFY it must
+        // still be confirmed, or every future esp_ota_begin() fails with
+        // ESP_ERR_OTA_ROLLBACK_INVALID_STATE and OTA is permanently blocked.
+        // self_test_task never marks valid, so confirm it here.
+        confirm_running_if_pending(running);
         return;
     }
 
@@ -1375,6 +1417,10 @@ static void init_ota_probation()
         ESP_LOGI(TAG, "OTA probation marker is stale (slot=%s, running=%s) — clearing",
                  marker_slot, running->label);
         ota_health_clear();
+        // The running slot is not the one under probation, so it is
+        // markerless-equivalent: same permanent-OTA-brick risk if it booted
+        // PENDING_VERIFY (e.g. USB-flashed ota_0 with a leftover ota_1 marker).
+        confirm_running_if_pending(running);
         return;
     }
 
@@ -1766,9 +1812,11 @@ static bool matter_is_ready();  // defined below; used by self_test_task
 // increment the strike count and roll back after APP_OTA_MAX_STRIKES failures.
 //
 // Manages probation strictly via the NVS marker (written by
-// install_https_ota_with_verify), not the partition state, because
-// init_ota_probation() already called mark_app_valid_cancel_rollback() and
-// neutralized the bootloader's PENDING_VERIFY tracking.
+// install_https_ota_with_verify), not the partition state. Marking the running
+// image valid is handled entirely by init_ota_probation(): via the strike path
+// for a matching marker, or via confirm_running_if_pending() for a markerless
+// or stale-marker PENDING_VERIFY image. This task therefore only ever clears
+// the marker on success; it never calls mark_app_valid_cancel_rollback().
 static void self_test_task(void *arg)
 {
     (void) arg;
