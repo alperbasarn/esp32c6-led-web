@@ -34,10 +34,13 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "led_control.h"
 #include "led_strip.h"
 #include "lwip/inet.h"
 #include "mbedtls/pk.h"
 #include "mbedtls/sha256.h"
+#include "mqtt_link.h"
+#include "mqtt_proto.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
@@ -233,6 +236,39 @@ static uint8_t s_relative_action = 0;       // 0=off, 1=on
 static int32_t s_sched_last_fired_min[APP_MAX_SCHEDULES] = {
     -1, -1, -1, -1, -1, -1, -1, -1};        // epoch-minute of last fire (dedupe)
 
+// Debounced persistence for control changes that can arrive in bursts (an MQTT
+// `set` follows a knob drag at up to 10/s). The web and Matter paths still
+// write through immediately; only the MQTT path defers, and the flush runs on
+// the schedule task — never on the effect task.
+#define APP_PERSIST_DEBOUNCE_MS 2000
+static bool    s_persist_pending = false;
+static int64_t s_persist_due_us = 0;
+
+// Pairing feedback on the strip. The MQTT link only raises a flag here; the
+// effect task copies it inside its existing s_state_mutex critical section and
+// renders the pattern after releasing the lock, so the LED path never holds the
+// state mutex and the caller never blocks on the strip.
+typedef enum {
+    LED_INDICATOR_NONE = 0,
+    LED_INDICATOR_CODE,    // repeat N blinks while a pairing window is open
+    LED_INDICATOR_SUCCESS, // one green flash
+    LED_INDICATOR_FAILURE, // one red flash
+} led_indicator_mode_t;
+
+#define APP_INDICATOR_BLINK_ON_MS  160
+#define APP_INDICATOR_BLINK_OFF_MS 220
+#define APP_INDICATOR_GAP_MS       1200
+#define APP_INDICATOR_FLASH_MS     500
+// The indicator lights every pixel, so it follows the user's own brightness
+// (their supply is sized for it) inside a visible floor and a modest ceiling
+// rather than blasting a long strip at full white.
+#define APP_INDICATOR_MIN_LEVEL    48
+#define APP_INDICATOR_MAX_LEVEL    160
+
+static led_indicator_mode_t s_indicator_mode = LED_INDICATOR_NONE;
+static uint8_t              s_indicator_code = 0;
+static int64_t              s_indicator_started_us = 0;
+
 static constexpr char INDEX_HTML[] = R"HTML(
 <!doctype html>
 <html lang="en">
@@ -352,6 +388,41 @@ select{width:100%;background:var(--surface);border:1px solid var(--line);color:v
 </div>
 <div class="status" id="configStatus" role="status" aria-live="polite"></div>
 <div class="footer">New AP credentials are saved immediately but become active after a reset. Firmware and configuration administration is available from the device SoftAP; the LAN view remains useful for status and LED control. With auto-install on, the device installs newer published releases on its own; off, it only checks and surfaces them for you to press Install Update.</div>
+</div>
+<div class="card">
+<h2>MQTT Link</h2>
+<div class="kv">
+<div class="kv-line"><span>Link Status</span><span id="mqttStatusValue">-</span></div>
+<div class="kv-line"><span>Device Id</span><span id="mqttDeviceId">-</span></div>
+<div class="kv-line"><span>Last Error</span><span id="mqttError">None</span></div>
+<div class="kv-line"><span>Pairing Window</span><span id="mqttPairing">Closed</span></div>
+</div>
+<div class="row">
+<div>
+<div class="label"><span>Broker Host</span><span class="value">blank disables the link</span></div>
+<input id="mqttHost" type="text" maxlength="63" placeholder="broker.example.com" value="" aria-label="MQTT broker host">
+</div>
+<div>
+<div class="label"><span>Port</span><span class="value">1-65535</span></div>
+<input id="mqttPort" type="number" min="1" max="65535" value="8883" aria-label="MQTT broker port">
+</div>
+<div>
+<div class="label"><span>Username</span><span class="value">optional</span></div>
+<input id="mqttUser" type="text" maxlength="47" value="" aria-label="MQTT username">
+</div>
+<div>
+<div class="label"><span>Password</span><span class="value">blank keeps current</span></div>
+<input id="mqttPass" type="password" maxlength="71" placeholder="Leave blank to keep the current password" value="" aria-label="MQTT password (leave blank to keep current)">
+</div>
+<label class="toggle"><span>Use TLS (mqtts)</span><input id="mqttTls" type="checkbox" checked></label>
+</div>
+<div class="actions">
+<button class="btn btn-primary" id="saveMqttBtn">Save MQTT Settings</button>
+</div>
+<div class="status" id="mqttStatus" role="status" aria-live="polite"></div>
+<h2 style="margin-top:18px;font-size:1rem">Paired Controllers</h2>
+<div class="kv" id="mqttControllers"></div>
+<div class="footer">Broker settings are accepted from the device SoftAP only and the password is never shown again. A controller pairs from its own screen: the strip blinks a code, you confirm it there. Factory reset clears both the broker settings and this list.</div>
 </div>
 <div class="card">
 <h2>Firmware Actions</h2>
@@ -492,6 +563,18 @@ const configCountValue = document.getElementById('configCountValue');
 const configApSsid = document.getElementById('configApSsid');
 const configApPassword = document.getElementById('configApPassword');
 const configAutoInstall = document.getElementById('configAutoInstall');
+const mqttStatusValue = document.getElementById('mqttStatusValue');
+const mqttDeviceId = document.getElementById('mqttDeviceId');
+const mqttError = document.getElementById('mqttError');
+const mqttPairing = document.getElementById('mqttPairing');
+const mqttHost = document.getElementById('mqttHost');
+const mqttPort = document.getElementById('mqttPort');
+const mqttUser = document.getElementById('mqttUser');
+const mqttPass = document.getElementById('mqttPass');
+const mqttTls = document.getElementById('mqttTls');
+const saveMqttBtn = document.getElementById('saveMqttBtn');
+const mqttStatus = document.getElementById('mqttStatus');
+const mqttControllers = document.getElementById('mqttControllers');
 const controlBrightness = document.getElementById('controlBrightness');
 const controlColor = document.getElementById('controlColor');
 const controlColorValue = document.getElementById('controlColorValue');
@@ -611,16 +694,21 @@ async function loadSchedule(){const res=await fetch('/api/schedule',{cache:'no-s
 async function saveSchedule(){scheduleStatus.textContent='Saving schedules...';const schedules=scheduleRowEls.map(readScheduleRow);const payload={tz:scheduleTz.value.trim(),schedules:schedules};const res=await fetch('/api/schedule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const text=await res.text();if(!res.ok)throw new Error(text||'Failed to save schedules');let data={};try{data=JSON.parse(text)}catch(_){ }applyScheduleConfig(data);scheduleStatus.textContent='Schedules saved'}
 function refreshOverview(data){const admin=data.softap_admin!==false;const windowOpen=!!data.matter_window_open;overviewMatterStatus.textContent=data.commissioned?'Commissioned':'Ready to pair';overviewMatterEndpoint.textContent=data.matter_endpoint;overviewMatterFabricCount.textContent=(data.matter_fabric_count??'-');overviewMatterWindow.textContent=windowOpen?'Open':'Closed';openMatterWindowBtn.disabled=!admin||!data.matter_ready||!!data.commissioned||windowOpen;openMatterWindowBtn.textContent=windowOpen?'Pairing Window Open':(data.commissioned?'Pairing Managed by Matter':'Open 5-Minute Pairing Window');if(!userMsgRecent(matterPairingStatus)){matterPairingStatus.textContent=!admin?'Connect to the device SoftAP to open pairing.':!data.matter_ready?'Matter stack is not ready.':windowOpen?'Open for 5 minutes.':data.commissioned?'Closed; use an existing Matter administrator to add a controller.':'Closed; press the button to open it.'}overviewManualCode.textContent=data.manual_code||'Unavailable';setLink(overviewQrLink,data.qr_url,'Unavailable');overviewApSsid.textContent=data.ap_ssid||'-';setLink(overviewApUrl,data.ap_url||(data.ap_ip?('http://'+data.ap_ip):''),'Unavailable');overviewStaStatus.textContent=data.sta_connected?'Connected':'Not connected';overviewStaSsid.textContent=data.sta_ssid||'-';overviewStaBssid.textContent=(data.sta_bssid||'-')+(data.sta_channel?(' / ch '+data.sta_channel):'');overviewStaRssi.textContent=(data.sta_rssi||data.sta_rssi===0)?(data.sta_rssi+' dBm'):'-';overviewStaReason.textContent=(data.sta_last_disconnect_reason&&data.sta_last_disconnect_reason!==0)?((data.sta_last_disconnect_reason_text||'unknown')+' ('+String(data.sta_last_disconnect_reason)+')'):'None';setLink(overviewLanUrl,data.lan_url||(data.sta_ip?('http://'+data.sta_ip):''),'Not connected');overviewApRestart.textContent=data.ap_restart_required?'Yes, reboot to apply new AP config':'No';overviewFwVersion.textContent=data.fw_version||'unknown';overviewRunningPartition.textContent=data.running_partition||'-';overviewNextPartition.textContent=data.ota_target_partition||'-';overviewRevertTarget.textContent=data.revert_available?((data.revert_version||'unknown')+' @ '+(data.revert_partition||'')):'No previous firmware available';overviewPublishedVersion.textContent=data.auto_update_latest_version||'Unknown';overviewUpdateStatus.textContent=data.auto_update_status||'Idle'}
 function refreshFirmwarePanel(data){const cur=data.fw_version||'unknown';const avail=data.auto_update_latest_version||'';const admin=data.softap_admin!==false;firmwareCurrentVersion.textContent=cur;firmwareAvailableVersion.textContent=avail?avail:'No update available';const canInstall=!!data.auto_update_available && !data.auto_update_busy && avail && avail!==cur;installUpdateBtn.disabled=!admin||!canInstall;installUpdateBtn.textContent=data.auto_update_busy?'Installing...':(canInstall?('Install Update '+avail):'Install Update');if(!userMsgRecent(updateStatusLine)){updateStatusLine.textContent=data.auto_update_status||'Idle'}}
+function renderMqttControllers(list,admin){mqttControllers.textContent='';const items=Array.isArray(list)?list:[];if(!items.length){const empty=document.createElement('div');empty.className='kv-line';const label=document.createElement('span');label.textContent='No controllers paired';empty.appendChild(label);mqttControllers.appendChild(empty);return}items.forEach((entry)=>{const row=document.createElement('div');row.className='kv-line';const label=document.createElement('span');label.textContent=(entry&&entry.name)?entry.name:'(unnamed)';const right=document.createElement('span');const id=document.createElement('span');id.textContent=(entry&&entry.id)?entry.id:'';const btn=document.createElement('button');btn.className='btn btn-secondary';btn.style.marginLeft='10px';btn.style.padding='6px 12px';btn.textContent='Unpair';btn.disabled=!admin;btn.addEventListener('click',()=>unpairController(entry&&entry.id).catch(err=>mqttStatus.textContent=err.message));right.appendChild(id);right.appendChild(btn);row.appendChild(label);row.appendChild(right);mqttControllers.appendChild(row)})}
+function renderMqtt(data){const admin=data.softap_admin!==false;mqttStatusValue.textContent=data.mqtt_status||'-';mqttDeviceId.textContent=data.mqtt_device_id||'-';mqttError.textContent=data.mqtt_error?data.mqtt_error:'None';mqttPairing.textContent=data.mqtt_pairing?'Open - count the blinks on the strip':'Closed';renderMqttControllers(data.mqtt_controllers,admin)}
+function applyMqttConfig(data){mqttHost.value=data.mqtt_host||'';if(Number(data.mqtt_port)>0)mqttPort.value=Number(data.mqtt_port);mqttUser.value=data.mqtt_user||'';mqttPass.value='';if(typeof data.mqtt_tls==='boolean')mqttTls.checked=data.mqtt_tls}
+async function saveMqtt(){mqttStatus.textContent='Saving MQTT settings...';const payload={count:Number(configCount.value),ap_ssid:configApSsid.value.trim(),ap_password:'',auto_install_enabled:!!configAutoInstall.checked,mqtt_host:mqttHost.value.trim(),mqtt_port:Math.max(1,Math.min(65535,Number(mqttPort.value)||8883)),mqtt_user:mqttUser.value.trim(),mqtt_pass:mqttPass.value,mqtt_tls:!!mqttTls.checked};const res=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!res.ok)throw new Error(await res.text()||'Failed to save MQTT settings');const data=await res.json();applyStateToUi(data);mqttStatus.textContent=payload.mqtt_host?'MQTT settings saved. The link reconnects in the background.':'MQTT link disabled.'}
+async function unpairController(id){if(!id)return;if(!window.confirm('Unpair '+id+' from this strip?'))return;mqttStatus.textContent='Unpairing '+id+'...';const res=await fetch('/api/mqtt/unpair',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok)throw new Error(data.message||text||'Failed to unpair');mqttStatus.textContent=data.message||'Controller unpaired';loadState().catch(()=>{})}
 function setOtaBusy(busy){otaBtn.disabled=busy;otaFile.disabled=busy;otaBtn.textContent=busy?'Uploading OTA...':'Install From File'}
 function setScheduleEditorDisabled(disabled){scheduleTz.disabled=disabled;saveScheduleBtn.disabled=disabled;scheduleRowEls.forEach((slot)=>{slot.enabled.disabled=disabled;slot.time.disabled=disabled;slot.action.disabled=disabled;slot.days.forEach((cb)=>{cb.disabled=disabled})})}
-function applyAdminGating(data){const admin=data.softap_admin!==false;const adminControls=[configCount,configCountNumber,configApSsid,configApPassword,configAutoInstall,saveConfigBtn,rebootBtn,otaBtn,otaFile,checkUpdateBtn,openMatterWindowBtn,factoryResetBtn];adminControls.forEach((element)=>{element.disabled=!admin});revertBtn.disabled=!admin||!data.revert_available;setScheduleEditorDisabled(!admin)}
-function applyStateToUi(data){const admin=data.softap_admin!==false;effectProfiles=normalizeEffectProfiles(data.effect_profiles);effectColors=normalizeEffectColors(data.effect_colors);selectedEffect=data.effect||'solid';syncConfigCount(data.count);configCount.max=data.max_leds;configCountNumber.max=data.max_leds;configApSsid.value=data.config_ap_ssid||data.ap_ssid||'';configApPassword.value='';if(typeof data.auto_install_enabled==='boolean'){configAutoInstall.checked=data.auto_install_enabled}controlBrightness.value=data.brightness;controlColor.value=data.color||controlColor.value;applyAdminGating(data);refreshOverview(data);refreshFirmwarePanel(data);otaStatus.textContent=admin?'Next OTA slot: '+(data.ota_target_partition||'unknown')+'. Upload build/esp32c6_led_web.bin after the first USB flash.':'Connect to the device SoftAP to administer firmware and configuration.';syncEffectControls();updateControlReadout();syncTimer(data.relative_active,data.relative_action,data.relative_remaining_s)}
+function applyAdminGating(data){const admin=data.softap_admin!==false;const adminControls=[configCount,configCountNumber,configApSsid,configApPassword,configAutoInstall,saveConfigBtn,rebootBtn,otaBtn,otaFile,checkUpdateBtn,openMatterWindowBtn,factoryResetBtn,mqttHost,mqttPort,mqttUser,mqttPass,mqttTls,saveMqttBtn];adminControls.forEach((element)=>{element.disabled=!admin});revertBtn.disabled=!admin||!data.revert_available;setScheduleEditorDisabled(!admin)}
+function applyStateToUi(data){const admin=data.softap_admin!==false;effectProfiles=normalizeEffectProfiles(data.effect_profiles);effectColors=normalizeEffectColors(data.effect_colors);selectedEffect=data.effect||'solid';syncConfigCount(data.count);configCount.max=data.max_leds;configCountNumber.max=data.max_leds;configApSsid.value=data.config_ap_ssid||data.ap_ssid||'';configApPassword.value='';if(typeof data.auto_install_enabled==='boolean'){configAutoInstall.checked=data.auto_install_enabled}controlBrightness.value=data.brightness;controlColor.value=data.color||controlColor.value;applyAdminGating(data);refreshOverview(data);refreshFirmwarePanel(data);applyMqttConfig(data);renderMqtt(data);otaStatus.textContent=admin?'Next OTA slot: '+(data.ota_target_partition||'unknown')+'. Upload build/esp32c6_led_web.bin after the first USB flash.':'Connect to the device SoftAP to administer firmware and configuration.';syncEffectControls();updateControlReadout();syncTimer(data.relative_active,data.relative_action,data.relative_remaining_s)}
 async function loadState(){controlStatus.textContent='Loading device state...';const res=await fetch('/api/state');if(!res.ok)throw new Error('Failed to load state');const data=await res.json();applyStateToUi(data);loadSchedule().catch(err=>scheduleStatus.textContent=err.message);controlStatus.textContent='Device state loaded';configStatus.textContent=data.ap_restart_required?'Saved AP config is waiting for a reboot.':'Configuration loaded'}
 let connMisses=0;let connDown=false;
 function showConnDown(msg){if(connDown&&connBanner.textContent===msg)return;connBanner.textContent=msg;connBanner.hidden=false;pageWrap.classList.add('stale');connDown=true}
 function clearConnDown(){if(!connDown)return;connBanner.hidden=true;pageWrap.classList.remove('stale');connDown=false}
 function recoverAfterReboot(){otaInFlight=true;connDown=true;connBanner.textContent='Device is restarting - reconnecting...';connBanner.hidden=false;pageWrap.classList.add('stale');const start=Date.now();const retry=()=>{if(Date.now()-start>90000){connBanner.textContent='Device still unreachable - reload manually.'}else{setTimeout(tick,2000)}};function tick(){fetch('/api/state',{cache:'no-store'}).then((res)=>{if(res.ok){window.location.reload()}else{retry()}}).catch(retry)}setTimeout(tick,2000)}
-async function pollStatus(){if(document.hidden)return;try{const res=await fetch('/api/state',{cache:'no-store'});if(!res.ok)throw new Error('poll status '+res.status);const data=await res.json();connMisses=0;if(!otaInFlight)clearConnDown();applyAdminGating(data);refreshOverview(data);refreshFirmwarePanel(data);reconcileControls(data);syncTimer(data.relative_active,data.relative_action,data.relative_remaining_s);updateScheduleTimeLine(!!data.time_valid,data.now_local)}catch(_){if(otaInFlight)return;connMisses++;if(connMisses>=2)showConnDown('Device unreachable - reconnecting...')}}
+async function pollStatus(){if(document.hidden)return;try{const res=await fetch('/api/state',{cache:'no-store'});if(!res.ok)throw new Error('poll status '+res.status);const data=await res.json();connMisses=0;if(!otaInFlight)clearConnDown();applyAdminGating(data);refreshOverview(data);refreshFirmwarePanel(data);renderMqtt(data);reconcileControls(data);syncTimer(data.relative_active,data.relative_action,data.relative_remaining_s);updateScheduleTimeLine(!!data.time_valid,data.now_local)}catch(_){if(otaInFlight)return;connMisses++;if(connMisses>=2)showConnDown('Device unreachable - reconnecting...')}}
 async function saveControl(){controlStatus.textContent='Applying control...';if(liveApplyTimer){clearTimeout(liveApplyTimer);liveApplyTimer=null}liveApplyPending=false;stashEffectControls();const payload=buildControlPayload();const res=await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!res.ok)throw new Error(await res.text()||'Failed to apply control');const data=await res.json();applyStateToUi(data);controlStatus.textContent='Control saved'}
 async function saveConfig(){configStatus.textContent='Saving configuration...';const payload={count:Number(configCount.value),ap_ssid:configApSsid.value.trim(),ap_password:configApPassword.value,auto_install_enabled:!!configAutoInstall.checked};const res=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!res.ok)throw new Error(await res.text()||'Failed to save configuration');const data=await res.json();applyStateToUi(data);configStatus.textContent=data.ap_restart_required?'Configuration saved. Press Reboot to apply the new AP credentials.':'Configuration saved'}
 async function openMatterPairingWindow(){stampUserMsg(matterPairingStatus,'Opening Matter pairing window...');openMatterWindowBtn.disabled=true;const res=await fetch('/api/matter/pairing-window',{method:'POST'});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok)throw new Error(data.message||text||'Failed to open Matter pairing window');stampUserMsg(matterPairingStatus,data.message||'Matter pairing window opened');setTimeout(()=>loadState().catch(err=>stampUserMsg(matterPairingStatus,err.message)),500)}
@@ -637,6 +725,7 @@ effectParamRows.forEach((slot)=>slot.input.addEventListener('input',()=>{stashEf
 effectColor.addEventListener('input',()=>{effectColors[selectedEffect]=normalizeHexColor(effectColor.value,getSelectedEffectColor());updateControlReadout();scheduleLiveApply()});
 saveControlBtn.addEventListener('click',()=>saveControl().catch(err=>controlStatus.textContent=err.message));
 saveConfigBtn.addEventListener('click',()=>saveConfig().catch(err=>configStatus.textContent=err.message));
+saveMqttBtn.addEventListener('click',()=>saveMqtt().catch(err=>mqttStatus.textContent=err.message));
 timerStartBtn.addEventListener('click',()=>startTimer().catch(err=>timerStatus.textContent=err.message));
 timerCancelBtn.addEventListener('click',()=>cancelTimer().catch(err=>timerStatus.textContent=err.message));
 saveScheduleBtn.addEventListener('click',()=>saveSchedule().catch(err=>scheduleStatus.textContent=err.message));
@@ -2492,6 +2581,42 @@ cleanup:
     return err;
 }
 
+// Renders one flat colour across the configured count. Used by the pairing
+// indicator only; it takes s_led_mutex exactly like apply_led_state() and keeps
+// the same shrink bookkeeping, so a later effect frame still clears leftovers.
+static esp_err_t apply_solid_frame(uint16_t count, uint8_t red, uint8_t green, uint8_t blue)
+{
+    if (!s_led_strip || !s_led_mutex) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_led_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    uint16_t render_count = std::min<uint16_t>(count, APP_LED_MAX_PIXELS);
+    esp_err_t err = ESP_OK;
+    for (uint16_t i = 0; i < render_count; ++i) {
+        err = led_strip_set_pixel(s_led_strip, i, red, green, blue);
+        if (err != ESP_OK) {
+            goto cleanup;
+        }
+    }
+    for (uint16_t i = render_count; i < s_last_render_count; ++i) {
+        err = led_strip_set_pixel(s_led_strip, i, 0, 0, 0);
+        if (err != ESP_OK) {
+            goto cleanup;
+        }
+    }
+    err = led_strip_refresh(s_led_strip);
+    if (err == ESP_OK) {
+        s_last_render_count = render_count;
+    }
+
+cleanup:
+    xSemaphoreGive(s_led_mutex);
+    return err;
+}
+
 static void notify_effect_task()
 {
     TaskHandle_t effect_task_handle = s_effect_task;
@@ -2926,6 +3051,225 @@ static esp_err_t sync_matter_state_from_led_state()
     return ESP_OK;
 }
 
+// ---- Shared control path (web API and MQTT link) ---------------------------
+//
+// POST /api/control and an inbound MQTT `set` both land here, so the field
+// validation, the clamps, the Matter tracker refresh, the persist and the
+// effect-task notify exist exactly once. `require_full_tuple` keeps the web
+// API's "Missing fields" contract; the MQTT link passes false because the
+// contract lets a controller send any subset of the tuple.
+led_control_result_t led_control_apply_json(const cJSON *root, bool require_full_tuple, bool persist_now)
+{
+    if (!cJSON_IsObject(root)) {
+        return LED_CONTROL_ERR_FIELDS;
+    }
+
+    const cJSON *brightness = cJSON_GetObjectItemCaseSensitive(root, "brightness");
+    const cJSON *color = cJSON_GetObjectItemCaseSensitive(root, "color");
+    const cJSON *effect = cJSON_GetObjectItemCaseSensitive(root, "effect");
+    const cJSON *effect_params = cJSON_GetObjectItemCaseSensitive(root, "effect_params");
+    const cJSON *effect_color = cJSON_GetObjectItemCaseSensitive(root, "effect_color");
+    const cJSON *power = cJSON_GetObjectItemCaseSensitive(root, "power");
+
+    if (require_full_tuple) {
+        if (!cJSON_IsNumber(brightness) || !cJSON_IsString(color) || !cJSON_IsString(effect) ||
+            !cJSON_IsArray(effect_params) || !(cJSON_IsString(effect_color) || effect_color == nullptr) ||
+            !(cJSON_IsBool(power) || power == nullptr)) {
+            return LED_CONTROL_ERR_FIELDS;
+        }
+    } else {
+        // Partial update: every field is optional, but a present field must
+        // still carry the right type — inbound MQTT payloads are untrusted.
+        if ((brightness && !cJSON_IsNumber(brightness)) || (color && !cJSON_IsString(color)) ||
+            (effect && !cJSON_IsString(effect)) || (effect_params && !cJSON_IsArray(effect_params)) ||
+            (effect_color && !cJSON_IsString(effect_color)) || (power && !cJSON_IsBool(power))) {
+            return LED_CONTROL_ERR_FIELDS;
+        }
+        if (!brightness && !color && !effect && !effect_params && !effect_color && !power) {
+            return LED_CONTROL_ERR_EMPTY;
+        }
+    }
+
+    led_state_t updated;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    updated = s_led_state;
+    xSemaphoreGive(s_state_mutex);
+
+    // LED "count" is a Configuration item, settable only via the SoftAP-gated
+    // /api/config. Neither this path nor the MQTT link parses or applies it.
+    if (brightness) {
+        updated.brightness = clamp_u8(static_cast<int>(brightness->valuedouble));
+    }
+    if (color && !parse_hex_color(color->valuestring, &updated.red, &updated.green, &updated.blue)) {
+        return LED_CONTROL_ERR_COLOR;
+    }
+    if (effect) {
+        updated.effect = effect_from_name(effect->valuestring);
+    }
+    if (effect_params) {
+        for (size_t index = 0; index < kEffectParamSlotCount; ++index) {
+            const cJSON *item = cJSON_GetArrayItem(effect_params, index);
+            if (cJSON_IsNumber(item)) {
+                updated.effect_profiles[updated.effect].values[index] = clamp_u8(static_cast<int>(item->valuedouble));
+            }
+        }
+    }
+    if (effect_color &&
+        !parse_hex_color(effect_color->valuestring, &updated.effect_colors[updated.effect].red,
+                         &updated.effect_colors[updated.effect].green, &updated.effect_colors[updated.effect].blue)) {
+        return LED_CONTROL_ERR_EFFECT_COLOR;
+    }
+    clamp_effect_profile(updated.effect, &updated.effect_profiles[updated.effect]);
+    if (power) {
+        updated.power = cJSON_IsTrue(power);
+    } else if (brightness) {
+        // Same rule as the web page: a brightness-only change carries power.
+        updated.power = updated.brightness > 0;
+    }
+    clamp_state(&updated);
+    const bool effect_color_present = effect_color != nullptr;
+    const bool effect_params_present = effect_params != nullptr;
+
+    esp_err_t err = ESP_OK;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    led_state_t committed = s_led_state;
+    committed.brightness = updated.brightness;
+    committed.red = updated.red;
+    committed.green = updated.green;
+    committed.blue = updated.blue;
+    committed.effect = updated.effect;
+    committed.power = updated.power;
+    if (effect_params_present || require_full_tuple) {
+        committed.effect_profiles[updated.effect] = updated.effect_profiles[updated.effect];
+    }
+    if (effect_color_present) {
+        committed.effect_colors[updated.effect] = updated.effect_colors[updated.effect];
+    }
+    clamp_state(&committed);
+    s_led_state = committed;
+    refresh_matter_hs_trackers_from_rgb(s_led_state.red, s_led_state.green, s_led_state.blue);
+    rgb_to_matter_xy(s_led_state.red, s_led_state.green, s_led_state.blue, &s_matter_x, &s_matter_y);
+    if (persist_now) {
+        s_persist_pending = false;
+        err = save_state_to_nvs(&s_led_state);
+    } else {
+        // Debounced: a burst of MQTT sets collapses into one flash write.
+        s_persist_pending = true;
+        s_persist_due_us = esp_timer_get_time() + (int64_t) APP_PERSIST_DEBOUNCE_MS * 1000;
+    }
+    xSemaphoreGive(s_state_mutex);
+
+    // RAM state is already committed, so drive the strip regardless of whether
+    // the NVS persist succeeded.
+    notify_effect_task();
+    sync_matter_state_from_led_state();
+
+    return err == ESP_OK ? LED_CONTROL_OK : LED_CONTROL_ERR_SAVE;
+}
+
+void led_control_persist_tick(void)
+{
+    if (!s_state_mutex) {
+        return;
+    }
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    if (s_persist_pending && esp_timer_get_time() >= s_persist_due_us) {
+        s_persist_pending = false;
+        esp_err_t err = save_state_to_nvs(&s_led_state);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "debounced persist failed: %s", esp_err_to_name(err));
+        }
+    }
+    xSemaphoreGive(s_state_mutex);
+}
+
+void led_control_get_tuple(led_tuple_t *out)
+{
+    if (!out) {
+        return;
+    }
+    led_state_t snapshot;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    snapshot = s_led_state;
+    xSemaphoreGive(s_state_mutex);
+
+    std::memset(out, 0, sizeof(*out));
+    out->power = snapshot.power;
+    out->brightness = snapshot.brightness;
+    out->count = snapshot.count;
+    format_hex_color(snapshot.red, snapshot.green, snapshot.blue, out->color, sizeof(out->color));
+    copy_string_value(out->effect, sizeof(out->effect), effect_to_name(snapshot.effect));
+    const uint8_t effect = effect_from_index(snapshot.effect);
+    for (size_t index = 0; index < kEffectParamSlotCount && index < MQTT_PROTO_PARAM_COUNT; ++index) {
+        out->effect_params[index] = snapshot.effect_profiles[effect].values[index];
+    }
+    format_hex_color(snapshot.effect_colors[effect].red, snapshot.effect_colors[effect].green,
+                     snapshot.effect_colors[effect].blue, out->effect_color, sizeof(out->effect_color));
+}
+
+const char *led_control_firmware_version(void)
+{
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    return app_desc ? app_desc->version : "unknown";
+}
+
+void led_control_get_device_name(char *out, size_t out_len)
+{
+    if (!out || out_len == 0) {
+        return;
+    }
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    const char *name = s_runtime_ap_ssid[0] != '\0' ? s_runtime_ap_ssid : s_ap_ssid;
+    copy_string_value(out, out_len, name);
+    xSemaphoreGive(s_state_mutex);
+}
+
+void led_control_get_sta_ip(char *out, size_t out_len)
+{
+    if (!out || out_len == 0) {
+        return;
+    }
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    copy_string_value(out, out_len, s_sta_ip);
+    xSemaphoreGive(s_state_mutex);
+}
+
+uint16_t led_control_max_leds(void)
+{
+    return static_cast<uint16_t>(APP_LED_MAX_PIXELS);
+}
+
+static void set_indicator(led_indicator_mode_t mode, uint8_t code)
+{
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_indicator_mode = mode;
+    s_indicator_code = code;
+    s_indicator_started_us = esp_timer_get_time();
+    xSemaphoreGive(s_state_mutex);
+    notify_effect_task();
+}
+
+void led_control_indicator_blink(uint8_t code)
+{
+    if (code < MQTT_PROTO_PAIR_CODE_MIN) {
+        code = MQTT_PROTO_PAIR_CODE_MIN;
+    }
+    if (code > MQTT_PROTO_PAIR_CODE_MAX) {
+        code = MQTT_PROTO_PAIR_CODE_MAX;
+    }
+    set_indicator(LED_INDICATOR_CODE, code);
+}
+
+void led_control_indicator_flash(bool success)
+{
+    set_indicator(success ? LED_INDICATOR_SUCCESS : LED_INDICATOR_FAILURE, 0);
+}
+
+void led_control_indicator_clear(void)
+{
+    set_indicator(LED_INDICATOR_NONE, 0);
+}
+
 // ---- Time subsystem, schedules, and the automatic on/off scheduler ---------
 
 static void apply_tz()
@@ -2989,14 +3333,19 @@ static void load_schedules()
 // commit path used elsewhere. Safe to call from a FreeRTOS task.
 static void apply_power_action(bool on)
 {
+    bool changed = false;
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     if (s_led_state.power != on) {
         s_led_state.power = on;
         save_state_to_nvs(&s_led_state);
+        changed = true;
     }
     xSemaphoreGive(s_state_mutex);
     notify_effect_task();
     sync_matter_state_from_led_state();
+    if (changed) {
+        mqtt_link_state_changed("schedule");
+    }
 }
 
 static void schedule_task(void *arg)
@@ -3007,6 +3356,11 @@ static void schedule_task(void *arg)
         // deadline (matching the UI countdown) instead of lagging up to the old
         // 10 s poll interval. Wall-clock schedules still de-dupe per minute.
         vTaskDelay(pdMS_TO_TICKS(1000));
+
+        // Flush a debounced control persist (MQTT `set` bursts) if one is due.
+        // This task is the right owner: it already ticks once a second and,
+        // unlike the effect task, may block on a flash write.
+        led_control_persist_tick();
 
         // Relative one-shot timer (monotonic; survives without time sync).
         bool relative_fire = false;
@@ -3172,6 +3526,10 @@ static esp_err_t send_state_json(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "relative_action", rel_action);
     cJSON_AddNumberToObject(root, "relative_remaining_s", rel_remaining_s);
 
+    // MQTT link status, paired controllers and (SoftAP admins only) the broker
+    // address. The broker password is never part of this document.
+    mqtt_link_add_state_json(root, softap_admin);
+
     char *response = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (!response) {
@@ -3255,91 +3613,34 @@ static esp_err_t control_post_handler(httpd_req_t *req)
         return httpd_resp_sendstr(req, "Invalid JSON");
     }
 
-    led_state_t updated;
-    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    updated = s_led_state;
-    xSemaphoreGive(s_state_mutex);
-
     // LED "count" is a Configuration item, settable only via the SoftAP-gated
     // /api/config. This ungated handler (also POST /api/state) intentionally
-    // does not parse or apply count.
-    cJSON *brightness = cJSON_GetObjectItemCaseSensitive(root, "brightness");
-    cJSON *color = cJSON_GetObjectItemCaseSensitive(root, "color");
-    cJSON *effect = cJSON_GetObjectItemCaseSensitive(root, "effect");
-    cJSON *effect_params = cJSON_GetObjectItemCaseSensitive(root, "effect_params");
-    cJSON *effect_color = cJSON_GetObjectItemCaseSensitive(root, "effect_color");
-    cJSON *power = cJSON_GetObjectItemCaseSensitive(root, "power");
+    // does not parse or apply count. Validation, clamping, persistence and the
+    // Matter sync all live in led_control_apply_json(), which the MQTT link
+    // shares.
+    const led_control_result_t result = led_control_apply_json(root, true, true);
+    cJSON_Delete(root);
 
-    if (!cJSON_IsNumber(brightness) || !cJSON_IsString(color) ||
-        !cJSON_IsString(effect) || !cJSON_IsArray(effect_params) ||
-        !(cJSON_IsString(effect_color) || effect_color == nullptr) ||
-        !(cJSON_IsBool(power) || power == nullptr)) {
-        cJSON_Delete(root);
+    switch (result) {
+    case LED_CONTROL_OK:
+        break;
+    case LED_CONTROL_ERR_COLOR:
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "Invalid color");
+    case LED_CONTROL_ERR_EFFECT_COLOR:
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "Invalid effect color");
+    case LED_CONTROL_ERR_SAVE:
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "Failed to update LED state");
+    case LED_CONTROL_ERR_FIELDS:
+    case LED_CONTROL_ERR_EMPTY:
+    default:
         httpd_resp_set_status(req, "400 Bad Request");
         return httpd_resp_sendstr(req, "Missing fields");
     }
 
-    updated.brightness = clamp_u8(static_cast<int>(brightness->valuedouble));
-    if (!parse_hex_color(color->valuestring, &updated.red, &updated.green, &updated.blue)) {
-        cJSON_Delete(root);
-        httpd_resp_set_status(req, "400 Bad Request");
-        return httpd_resp_sendstr(req, "Invalid color");
-    }
-    updated.effect = effect_from_name(effect->valuestring);
-    for (size_t index = 0; index < kEffectParamSlotCount; ++index) {
-        cJSON *item = cJSON_GetArrayItem(effect_params, index);
-        if (cJSON_IsNumber(item)) {
-            updated.effect_profiles[updated.effect].values[index] = clamp_u8(static_cast<int>(item->valuedouble));
-        }
-    }
-    if (effect_color &&
-        !parse_hex_color(effect_color->valuestring, &updated.effect_colors[updated.effect].red,
-                         &updated.effect_colors[updated.effect].green, &updated.effect_colors[updated.effect].blue)) {
-        cJSON_Delete(root);
-        httpd_resp_set_status(req, "400 Bad Request");
-        return httpd_resp_sendstr(req, "Invalid effect color");
-    }
-    clamp_effect_profile(updated.effect, &updated.effect_profiles[updated.effect]);
-    if (power) {
-        updated.power = cJSON_IsTrue(power);
-    } else {
-        updated.power = updated.brightness > 0;
-    }
-    clamp_state(&updated);
-    const bool effect_color_present = effect_color != nullptr;
-    cJSON_Delete(root);
-
-    esp_err_t err = ESP_OK;
-    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    led_state_t committed = s_led_state;
-    committed.brightness = updated.brightness;
-    committed.red = updated.red;
-    committed.green = updated.green;
-    committed.blue = updated.blue;
-    committed.effect = updated.effect;
-    committed.power = updated.power;
-    committed.effect_profiles[updated.effect] = updated.effect_profiles[updated.effect];
-    if (effect_color_present) {
-        committed.effect_colors[updated.effect] = updated.effect_colors[updated.effect];
-    }
-    clamp_state(&committed);
-    s_led_state = committed;
-    refresh_matter_hs_trackers_from_rgb(s_led_state.red, s_led_state.green, s_led_state.blue);
-    rgb_to_matter_xy(s_led_state.red, s_led_state.green, s_led_state.blue, &s_matter_x, &s_matter_y);
-    err = save_state_to_nvs(&s_led_state);
-    xSemaphoreGive(s_state_mutex);
-
-    // RAM state is already committed, so drive the strip regardless of whether
-    // the NVS persist succeeded — otherwise /api/state would report the new
-    // state while the physical strip stays on the old frame.
-    notify_effect_task();
-
-    if (err != ESP_OK) {
-        httpd_resp_set_status(req, "500 Internal Server Error");
-        return httpd_resp_sendstr(req, "Failed to update LED state");
-    }
-
-    sync_matter_state_from_led_state();
+    mqtt_link_state_changed("web");
 
     return send_state_json(req);
 }
@@ -3392,6 +3693,15 @@ static esp_err_t config_post_handler(httpd_req_t *req)
         return httpd_resp_sendstr(req, "AP SSID must be 1-32 chars and password must be 8-63 chars");
     }
 
+    // Broker settings ride along on this SoftAP-gated endpoint: the MQTT link
+    // must never learn them from a LAN client. Absent fields change nothing.
+    esp_err_t mqtt_err = mqtt_link_apply_config_json(root);
+    if (mqtt_err == ESP_ERR_INVALID_ARG) {
+        cJSON_Delete(root);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "Invalid MQTT broker settings");
+    }
+
     esp_err_t err = ESP_OK;
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     s_led_state.count = static_cast<uint16_t>(count->valuedouble);
@@ -3410,6 +3720,7 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     // Apply to the strip regardless of the persistence result (RAM state is
     // already updated); still report 500 if the save itself failed.
     notify_effect_task();
+    mqtt_link_state_changed("web");
 
     if (err != ESP_OK) {
         httpd_resp_set_status(req, "500 Internal Server Error");
@@ -3452,6 +3763,52 @@ static esp_err_t require_softap_admin(httpd_req_t *req)
 
     httpd_resp_set_status(req, "403 Forbidden");
     return send_message_json(req, "This administration action is available from the device SoftAP only.");
+}
+
+// Removing a paired HMI is an administration action, so it follows the same
+// SoftAP boundary as the rest of the Configuration tab.
+static esp_err_t mqtt_unpair_post_handler(httpd_req_t *req)
+{
+    esp_err_t access_err = require_softap_admin(req);
+    if (access_err != ESP_OK) {
+        return access_err;
+    }
+
+    char *body = read_request_body(req);
+    if (!body) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return send_message_json(req, "Failed to read request body");
+    }
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+    if (!root) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return send_message_json(req, "Invalid JSON");
+    }
+
+    cJSON *id = cJSON_GetObjectItemCaseSensitive(root, "id");
+    if (!cJSON_IsString(id)) {
+        cJSON_Delete(root);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return send_message_json(req, "Missing controller id");
+    }
+
+    esp_err_t err = mqtt_link_unpair(id->valuestring);
+    cJSON_Delete(root);
+
+    if (err == ESP_ERR_NOT_FOUND) {
+        httpd_resp_set_status(req, "404 Not Found");
+        return send_message_json(req, "That controller is not paired with this strip.");
+    }
+    if (err == ESP_ERR_INVALID_ARG) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return send_message_json(req, "Invalid controller id");
+    }
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return send_message_json(req, "Controller removed, but saving the list failed.");
+    }
+    return send_message_json(req, "Controller unpaired");
 }
 
 static esp_err_t matter_pairing_window_post_handler(httpd_req_t *req)
@@ -3540,6 +3897,9 @@ static void factory_reset_task(void *arg)
 {
     (void) arg;
     vTaskDelay(pdMS_TO_TICKS(1500));
+    // Drop the paired controllers and broker settings from RAM and clear the
+    // retained topics before the namespace erase takes the stored copies.
+    mqtt_link_prepare_factory_reset();
     esp_err_t err = erase_app_settings_namespace();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to erase app settings namespace: %s", esp_err_to_name(err));
@@ -3820,10 +4180,70 @@ static void effect_task(void *arg)
     static TickType_t s_disp_last_tick = 0; // for measured-dt easing
 
     while (true) {
-        led_state_t snapshot = {};
+        led_state_t          snapshot = {};
+        led_indicator_mode_t indicator = LED_INDICATOR_NONE;
+        uint8_t              indicator_code = 0;
+        int64_t              indicator_started_us = 0;
         xSemaphoreTake(s_state_mutex, portMAX_DELAY);
         snapshot = s_led_state;
+        indicator = s_indicator_mode;
+        indicator_code = s_indicator_code;
+        indicator_started_us = s_indicator_started_us;
         xSemaphoreGive(s_state_mutex);
+
+        // Pairing feedback owns the strip while it runs: a blink code during an
+        // open pairing window, then one green or red flash. Rendering happens
+        // after the state mutex is released, exactly like the normal path.
+        if (indicator != LED_INDICATOR_NONE) {
+            const int64_t elapsed_ms = (esp_timer_get_time() - indicator_started_us) / 1000;
+            const uint8_t level = static_cast<uint8_t>(
+                std::clamp<int>(snapshot.brightness, APP_INDICATOR_MIN_LEVEL, APP_INDICATOR_MAX_LEVEL));
+            uint8_t red = 0;
+            uint8_t green = 0;
+            uint8_t blue = 0;
+            bool    done = false;
+
+            if (indicator == LED_INDICATOR_CODE) {
+                const int64_t slot = APP_INDICATOR_BLINK_ON_MS + APP_INDICATOR_BLINK_OFF_MS;
+                const int64_t train = slot * (indicator_code > 0 ? indicator_code : 1);
+                const int64_t cycle = train + APP_INDICATOR_GAP_MS;
+                const int64_t phase = elapsed_ms % cycle;
+                if (phase < train && (phase % slot) < APP_INDICATOR_BLINK_ON_MS) {
+                    red = green = blue = level; // neutral white, visible in any state
+                }
+            } else {
+                if (elapsed_ms >= APP_INDICATOR_FLASH_MS) {
+                    done = true;
+                } else if (indicator == LED_INDICATOR_SUCCESS) {
+                    green = level;
+                } else {
+                    red = level;
+                }
+            }
+
+            if (done) {
+                xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+                // Only clear what we saw: a newer indicator may have started.
+                if (s_indicator_mode == indicator && s_indicator_started_us == indicator_started_us) {
+                    s_indicator_mode = LED_INDICATOR_NONE;
+                    s_indicator_code = 0;
+                }
+                xSemaphoreGive(s_state_mutex);
+                // Fade the normal picture back in from black instead of
+                // snapping: keep the colour targets, restart the brightness ease.
+                s_disp_brightness = 0.0;
+                s_disp_last_tick = xTaskGetTickCount();
+                continue;
+            }
+
+            esp_err_t indicator_err = apply_solid_frame(snapshot.count, s_gamma_lut[red], s_gamma_lut[green],
+                                                        s_gamma_lut[blue]);
+            if (indicator_err != ESP_OK) {
+                ESP_LOGW(TAG, "indicator render failed: %s", esp_err_to_name(indicator_err));
+            }
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(40));
+            continue;
+        }
 
         // Easing runs after releasing s_state_mutex and before the render (which
         // takes s_led_mutex) -- the two locks are never held at once.
@@ -4174,6 +4594,11 @@ static void start_webserver()
     config_post.method = HTTP_POST;
     config_post.handler = config_post_handler;
 
+    httpd_uri_t mqtt_unpair_post = {};
+    mqtt_unpair_post.uri = "/api/mqtt/unpair";
+    mqtt_unpair_post.method = HTTP_POST;
+    mqtt_unpair_post.handler = mqtt_unpair_post_handler;
+
     httpd_uri_t matter_pairing_window_post = {};
     matter_pairing_window_post.uri = "/api/matter/pairing-window";
     matter_pairing_window_post.method = HTTP_POST;
@@ -4259,6 +4684,7 @@ static void start_webserver()
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &state_post));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &control_post));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &config_post));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &mqtt_unpair_post));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &matter_pairing_window_post));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &ota_post));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &check_update_post));
@@ -4445,6 +4871,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         s_sta_ip[0] = '\0';
         set_auto_update_state(false, false, s_auto_update_latest_version, s_auto_update_asset_url,
                               "Waiting for LAN Wi-Fi before checking published updates.");
+        mqtt_link_network_down();
         ESP_LOGI(TAG, "Matter station disconnected from upstream Wi-Fi");
         break;
     default:
@@ -4466,6 +4893,7 @@ static void ip_event_handler(void *arg, esp_event_base_t event_base, int32_t eve
         ESP_LOGI(TAG, "Matter station IP: %s", s_sta_ip);
         ESP_LOGI(TAG, "LAN web UI available at http://%s", s_sta_ip);
         start_sntp_once();
+        mqtt_link_network_up();
         if (s_auto_update_task) {
             // Refresh available-version info — never auto-install.
             set_pending_update_mode(published_update_mode_t::kCheckOnly);
@@ -4611,6 +5039,9 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
     // Drive the strip even if the NVS persist failed — RAM state is the source
     // of truth for the effect task; the persist error is still returned.
     notify_effect_task();
+    // Tell the HMI a remote change happened. Cheap: this only marks the link's
+    // coalescer and notifies its task, so the Matter callback never blocks.
+    mqtt_link_state_changed("matter");
     return err;
 }
 
@@ -4788,6 +5219,9 @@ extern "C" void app_main()
     PrintOnboardingCodes(chip::RendezvousInformationFlags(chip::RendezvousInformationFlag::kBLE));
 
     start_softap_overlay();
+    // The link needs the station MAC (available now) and its own NVS keys; it
+    // only dials out once the station has an IP.
+    mqtt_link_init();
     start_webserver();
     set_auto_update_state(false, false, "", "",
                           "Waiting for LAN Wi-Fi before checking published updates.");
@@ -4797,7 +5231,10 @@ extern "C" void app_main()
     xTaskCreate(captive_dns_task, "captive_dns", 4096, nullptr, 4, nullptr);
     xTaskCreate(schedule_task, "schedule", 4096, nullptr, 4, nullptr);
 
-    ESP_LOGI(TAG, "Project ready. LEDs=%u power=%u brightness=%u effect=%s color=#%02X%02X%02X",
+    // Free heap is logged here and again when the MQTT link connects, so the
+    // cost of the link on a running device can be read off the serial monitor.
+    ESP_LOGI(TAG,
+             "Project ready. LEDs=%u power=%u brightness=%u effect=%s color=#%02X%02X%02X free heap=%" PRIu32 " B",
              s_led_state.count, s_led_state.power, s_led_state.brightness, effect_to_name(s_led_state.effect),
-             s_led_state.red, s_led_state.green, s_led_state.blue);
+             s_led_state.red, s_led_state.green, s_led_state.blue, esp_get_free_heap_size());
 }
