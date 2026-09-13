@@ -6,6 +6,7 @@ It exposes the strip in two ways:
 
 - A local web page for LED count, color, brightness, effects, OTA, and reset actions
 - A Matter extended color light endpoint for Apple Home
+- An MQTT link to the round QNOB HMI (pairing, control, and retained status) — see [MQTT link to the QNOB HMI](#mqtt-link-to-the-qnob-hmi)
 - Local OTA firmware upload from the same web page (manual `.bin` install)
 - Periodic background checks against the latest published GitHub release; manual or automatic install with a signed-manifest verification chain
 - A firmware revert action that boots back into the other OTA slot
@@ -68,7 +69,7 @@ python -m esptool --chip esp32c6 -p COM6 -b 460800 --before default-reset --afte
 The device page is split into three tabs:
 
 - `Overview`: Matter state (including fabric count and commissioning-window status), a `Wi-Fi State` card (active AP SSID, station status/SSID, BSSID/channel, signal/RSSI, last disconnect reason, and an AP-restart-needed flag), AP and LAN web UI URLs, current firmware version, running slot, next OTA slot, revert target, latest available release, update status
-- `Configuration`: LED count, SoftAP SSID/password, a **Schedules** card and timezone field (see [Timers & schedules](#timers--schedules)), an **Install published updates automatically** toggle (default on), the Firmware Update card (Current vs. Available version, **Install Update** button, Check For Updates button, and a manual **Install From File** path), revert button, factory reset, reboot
+- `Configuration`: LED count, SoftAP SSID/password, an **MQTT Link** card (broker settings, link status, paired controllers — see [MQTT link to the QNOB HMI](#mqtt-link-to-the-qnob-hmi)), a **Schedules** card and timezone field (see [Timers & schedules](#timers--schedules)), an **Install published updates automatically** toggle (default on), the Firmware Update card (Current vs. Available version, **Install Update** button, Check For Updates button, and a manual **Install From File** path), revert button, factory reset, reboot
 - `Control`: brightness, color, a sleep/wake timer (see [Timers & schedules](#timers--schedules)), and one sub-tab per mode — `Solid` (the default) plus the seven animated effects — each with its own parameters. Brightness, color, and power changes are applied with a smooth eased ramp and gamma correction, so fades and on/off transitions look even and premium rather than steppy.
 
 The SoftAP SSID and password are the credentials hosted by the ESP32-C6 itself for the local setup page. On a fresh device they are generated automatically and printed to the serial log when the AP starts.
@@ -111,6 +112,50 @@ Schedule times and the displayed device time are interpreted in the timezone set
 - No offset / plain UTC: `UTC0` (the default)
 
 The timezone affects both the fixed schedules and the local time shown in the UI. The relative sleep/wake timer is unaffected — it counts elapsed minutes, not wall-clock time.
+
+## MQTT link to the QNOB HMI
+
+The strip can also be controlled and monitored by the round QNOB HMI over MQTT. The wire
+contract both firmwares implement is mirrored in [`docs/mqtt-contract.md`](docs/mqtt-contract.md);
+this section is the operator view.
+
+**Configure the broker.** Connect to the device SoftAP, open `Configuration` → **MQTT Link**,
+and fill in broker host, port, username, password and the TLS toggle. Like every other
+configuration item, broker settings are accepted from a SoftAP client only — never from the
+LAN — and the password is never read back by the API. An empty host disables the link. The
+card also shows the link status (`not configured`, `waiting for network`, `connecting`,
+`connected`, `error` plus the last error), the **device id** the topics are built from, and
+the paired controllers with an `Unpair` button each.
+
+**Topics.** Everything lives under `homio/led/<id>/`, where `<id>` is `led-` plus the last
+three bytes of the station MAC in lower-case hex (the exact value is on the MQTT Link card):
+
+| Topic | Direction | Retained | Payload |
+|---|---|---|---|
+| `info` | strip → HMI | yes | id, model, firmware version, name, max LEDs, IP — on every connect |
+| `status` | strip → HMI | yes | `online`, or `offline` as the last will (30 s keepalive) |
+| `state` | strip → HMI | yes | the full tuple (power, brightness, color, effect, params, effect color, count) plus `src` and `seq`, at most 10 per second |
+| `set` | HMI → strip | no | any subset of the tuple plus `from` and `seq` |
+| `pair` / `unpair` | HMI → strip | no | controller id, label, and the blink code when confirming |
+| `controllers` | strip → HMI | yes | the paired list, after every change |
+
+The strip connects only once it has joined your Wi-Fi (through Matter commissioning), and
+reconnects with exponential backoff up to 60 s.
+
+**Pairing.** A controller sends `pair`; the strip opens a 60-second window and repeatedly
+blinks a code of one to six blinks (white, at your own brightness setting inside a visible
+floor, so a long strip is never forced to full power). Count the blinks, confirm the number on the HMI, and the
+strip stores the controller (up to 4), flashes green once, and republishes `controllers`. A
+wrong code or a timeout flashes red and stores nothing. A factory-fresh strip — no controllers
+stored — accepts the first pairing without a code, so first-time setup is one tap. A `set`
+from a controller that is not paired changes nothing and gets a `state` back with
+`"rejected": true`.
+
+Pairing is ownership, not security: any client with broker credentials can publish. Per-device
+broker credentials and ACLs are the security boundary and are a later step.
+
+**Factory reset** clears the paired controllers and the broker settings along with the rest of
+the app settings.
 
 ## Pair with Apple Home
 
@@ -208,7 +253,7 @@ To bootstrap a fresh fork: generate a new keypair as above, replace the placehol
 ## Reset options
 
 - `Reboot`: reboots the device and applies any saved SoftAP credential changes
-- `Factory Reset`: clears the app settings namespace, then runs the Matter factory reset flow so pairing data and local settings are removed cleanly
+- `Factory Reset`: clears the app settings namespace — including the MQTT broker settings and the paired controller list — then runs the Matter factory reset flow so pairing data and local settings are removed cleanly
 - `Revert To Previous Firmware`: switches boot to the other OTA app slot without erasing settings
 
 ## Notes
