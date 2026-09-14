@@ -55,6 +55,27 @@ jobs:
       # shadows it on PATH, so export.sh computes the wrong idf<ver>_py<X>_env
       # name and fails. The steps below use the image's own python3.
 
+      # Runs before the ~7-minute firmware build so a broken model fails fast.
+      # Neither step needs the IDF toolchain: check_pure.sh only reads sources,
+      # and the host suites compile with the image's plain g++. IDF_PATH is set
+      # in the builder image, so run_tests.sh finds cJSON for the modules that
+      # need it and runs every module rather than skipping any.
+      - name: Model purity guard
+        shell: bash
+        run: ./tools/check_pure.sh
+
+      - name: Host tests
+        shell: bash
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          ./test/host/run_tests.sh
+          # main/model/ must be genuinely host-testable: if a module silently
+          # stops being built here, the suite would "pass" by running nothing.
+          for m in $(ls main/model/*.cpp 2>/dev/null | xargs -n1 basename | sed 's/\.cpp$//'); do
+            grep -q "^    \"$m|" test/host/run_tests.sh \
+              || { echo "::error::main/model/$m.cpp has no host test module registered in test/host/run_tests.sh"; exit 1; }
+          done
+
       - name: Build firmware
         shell: bash
         run: |

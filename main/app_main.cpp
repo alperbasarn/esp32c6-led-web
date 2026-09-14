@@ -35,6 +35,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "led_control.h"
+#include "model/color_model.h"
 #include "led_strip.h"
 #include "lwip/inet.h"
 #include "mbedtls/pk.h"
@@ -94,8 +95,6 @@
 static const char *TAG = "matter_led";
 static constexpr auto kCommissioningTimeoutSeconds = 300;
 static constexpr uint16_t kDefaultColorTempMireds = 0x00fa;
-static constexpr uint16_t kDefaultCurrentX = 0x616b;
-static constexpr uint16_t kDefaultCurrentY = 0x607d;
 static constexpr size_t kEffectParamSlotCount = 5;
 
 using namespace esp_matter;
@@ -182,8 +181,8 @@ static uint8_t s_gamma_lut[256];
 static uint16_t s_light_endpoint_id = 0;
 static uint8_t s_matter_hue = 0;
 static uint8_t s_matter_saturation = 0;
-static uint16_t s_matter_x = kDefaultCurrentX;
-static uint16_t s_matter_y = kDefaultCurrentY;
+static uint16_t s_matter_x = kColorDefaultCurrentX;
+static uint16_t s_matter_y = kColorDefaultCurrentY;
 static uint16_t s_matter_temp_mireds = kDefaultColorTempMireds;
 static bool s_syncing_matter = false;
 static bool s_network_handlers_registered = false;
@@ -1431,6 +1430,44 @@ static esp_err_t ota_health_write(const char *slot, const char *ver, uint8_t str
     return err;
 }
 
+// Confirm a *markerless* running image if the bootloader left it
+// PENDING_VERIFY. Such an image is NOT under our 2-strike probation: a
+// USB/JTAG bench flash, an image already promoted by a prior successful
+// self-test, a stale marker that references a different slot, or (rarely) a
+// published OTA whose probation-marker write was lost. With
+// CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y the bootloader leaves a freshly
+// booted image in ESP_OTA_IMG_PENDING_VERIFY, and the running app MUST confirm
+// itself via esp_ota_mark_app_valid_cancel_rollback() or (a) the bootloader
+// rolls it back on the next reset and (b) every later esp_ota_begin() fails
+// with ESP_ERR_OTA_ROLLBACK_INVALID_STATE — OTA is then permanently blocked.
+// Nothing else confirms these images (self_test_task never marks valid), so we
+// do it here. The image already passed SHA-256 and IDF image validation before
+// the bootloader jumped into it, so confirming is safe. We only ever act on a
+// PENDING_VERIFY image and never re-touch a VALID/UNDEFINED one; a failed state
+// read is a silent no-op.
+static void confirm_running_if_pending(const esp_partition_t *running)
+{
+    if (!running) {
+        return;
+    }
+    esp_ota_img_states_t st = ESP_OTA_IMG_UNDEFINED;
+    esp_err_t serr = esp_ota_get_state_partition(running, &st);
+    if (serr != ESP_OK) {
+        // Can't determine the otadata state — leave rollback state untouched.
+        ESP_LOGD(TAG, "OTA: esp_ota_get_state_partition(%s) failed: %s — "
+                      "leaving rollback state untouched",
+                 running->label, esp_err_to_name(serr));
+        return;
+    }
+    if (st != ESP_OTA_IMG_PENDING_VERIFY) {
+        return;  // already VALID/UNDEFINED/etc. — never touch a non-pending image
+    }
+    esp_err_t mv = esp_ota_mark_app_valid_cancel_rollback();
+    ESP_LOGI(TAG, "OTA: markerless image on %s was PENDING_VERIFY — confirmed "
+                  "valid to re-enable OTA (%s)",
+             running->label, esp_err_to_name(mv));
+}
+
 // Called very early in app_main, right after NVS init. Manages the
 // probationary boot lifecycle: if the running image is under probation,
 // either roll back (too many failed attempts), or increment the strike
@@ -1450,10 +1487,14 @@ static void init_ota_probation()
     esp_err_t err = ota_health_read(marker_slot, sizeof(marker_slot),
                                     marker_ver, sizeof(marker_ver), &strikes, &marker_manual);
     if (err == ESP_ERR_NVS_NOT_FOUND || marker_slot[0] == '\0') {
-        // No probation in progress — nothing to do. If the bootloader marked
-        // us PENDING_VERIFY anyway (e.g., first OTA from a previous firmware
-        // that didn't write a marker), fall back to default ROLLBACK_ENABLE
-        // behavior: the legacy self-test will mark us valid later.
+        // No probation marker for this boot: the image is not under our 2-strike
+        // probation (USB/JTAG flash, an image already promoted by a prior
+        // self-test, or a fresh OTA whose marker write was lost). We do NOT
+        // strike-count it. But if the bootloader left it PENDING_VERIFY it must
+        // still be confirmed, or every future esp_ota_begin() fails with
+        // ESP_ERR_OTA_ROLLBACK_INVALID_STATE and OTA is permanently blocked.
+        // self_test_task never marks valid, so confirm it here.
+        confirm_running_if_pending(running);
         return;
     }
 
@@ -1464,6 +1505,10 @@ static void init_ota_probation()
         ESP_LOGI(TAG, "OTA probation marker is stale (slot=%s, running=%s) — clearing",
                  marker_slot, running->label);
         ota_health_clear();
+        // The running slot is not the one under probation, so it is
+        // markerless-equivalent: same permanent-OTA-brick risk if it booted
+        // PENDING_VERIFY (e.g. USB-flashed ota_0 with a leftover ota_1 marker).
+        confirm_running_if_pending(running);
         return;
     }
 
@@ -1855,9 +1900,11 @@ static bool matter_is_ready();  // defined below; used by self_test_task
 // increment the strike count and roll back after APP_OTA_MAX_STRIKES failures.
 //
 // Manages probation strictly via the NVS marker (written by
-// install_https_ota_with_verify), not the partition state, because
-// init_ota_probation() already called mark_app_valid_cancel_rollback() and
-// neutralized the bootloader's PENDING_VERIFY tracking.
+// install_https_ota_with_verify), not the partition state. Marking the running
+// image valid is handled entirely by init_ota_probation(): via the strike path
+// for a matching marker, or via confirm_running_if_pending() for a markerless
+// or stale-marker PENDING_VERIFY image. This task therefore only ever clears
+// the marker on success; it never calls mark_app_valid_cancel_rollback().
 static void self_test_task(void *arg)
 {
     (void) arg;
@@ -2025,208 +2072,9 @@ static uint8_t matter_level_to_brightness(uint8_t level)
     return static_cast<uint8_t>((static_cast<uint32_t>(level) * 255 + 127) / 254);
 }
 
-static void rgb_to_matter_hs(uint8_t red, uint8_t green, uint8_t blue, uint8_t *matter_hue, uint8_t *matter_saturation)
-{
-    double rf = static_cast<double>(red) / 255.0;
-    double gf = static_cast<double>(green) / 255.0;
-    double bf = static_cast<double>(blue) / 255.0;
-    double max_value = std::max({rf, gf, bf});
-    double min_value = std::min({rf, gf, bf});
-    double delta = max_value - min_value;
-    double hue = 0.0;
-
-    if (delta > 0.0) {
-        if (max_value == rf) {
-            hue = 60.0 * std::fmod(((gf - bf) / delta), 6.0);
-        } else if (max_value == gf) {
-            hue = 60.0 * (((bf - rf) / delta) + 2.0);
-        } else {
-            hue = 60.0 * (((rf - gf) / delta) + 4.0);
-        }
-    }
-
-    if (hue < 0.0) {
-        hue += 360.0;
-    }
-
-    double saturation = max_value <= 0.0 ? 0.0 : (delta / max_value);
-    if (matter_hue) {
-        *matter_hue = clamp_u8(static_cast<int>(std::lround((hue / 360.0) * 254.0)));
-    }
-    if (matter_saturation) {
-        *matter_saturation = clamp_u8(static_cast<int>(std::lround(saturation * 254.0)));
-    }
-}
-
-static void matter_hs_to_rgb(uint8_t matter_hue, uint8_t matter_saturation, uint8_t *red, uint8_t *green, uint8_t *blue)
-{
-    double hue = (static_cast<double>(matter_hue) / 254.0) * 360.0;
-    double saturation = static_cast<double>(matter_saturation) / 254.0;
-    double value = 1.0;
-    double chroma = value * saturation;
-    double x = chroma * (1.0 - std::fabs(std::fmod(hue / 60.0, 2.0) - 1.0));
-    double match = value - chroma;
-    double rf = 0.0;
-    double gf = 0.0;
-    double bf = 0.0;
-
-    if (hue < 60.0) {
-        rf = chroma;
-        gf = x;
-    } else if (hue < 120.0) {
-        rf = x;
-        gf = chroma;
-    } else if (hue < 180.0) {
-        gf = chroma;
-        bf = x;
-    } else if (hue < 240.0) {
-        gf = x;
-        bf = chroma;
-    } else if (hue < 300.0) {
-        rf = x;
-        bf = chroma;
-    } else {
-        rf = chroma;
-        bf = x;
-    }
-
-    if (red) {
-        *red = clamp_u8(static_cast<int>(std::lround((rf + match) * 255.0)));
-    }
-    if (green) {
-        *green = clamp_u8(static_cast<int>(std::lround((gf + match) * 255.0)));
-    }
-    if (blue) {
-        *blue = clamp_u8(static_cast<int>(std::lround((bf + match) * 255.0)));
-    }
-}
-
-static void matter_xy_to_rgb(uint16_t current_x, uint16_t current_y, uint8_t *red, uint8_t *green, uint8_t *blue)
-{
-    double x = static_cast<double>(current_x) / 65535.0;
-    double y = static_cast<double>(current_y) / 65535.0;
-    if (y <= 0.0001) {
-        if (red) {
-            *red = 255;
-        }
-        if (green) {
-            *green = 255;
-        }
-        if (blue) {
-            *blue = 255;
-        }
-        return;
-    }
-
-    double z = std::max(0.0, 1.0 - x - y);
-    double luminance = 1.0;
-    double X = (luminance / y) * x;
-    double Y = luminance;
-    double Z = (luminance / y) * z;
-
-    double rf = X * 1.656492 - Y * 0.354851 - Z * 0.255038;
-    double gf = -X * 0.707196 + Y * 1.655397 + Z * 0.036152;
-    double bf = X * 0.051713 - Y * 0.121364 + Z * 1.011530;
-
-    rf = std::max(0.0, rf);
-    gf = std::max(0.0, gf);
-    bf = std::max(0.0, bf);
-
-    auto gamma_correct = [](double value) {
-        if (value <= 0.0031308) {
-            return 12.92 * value;
-        }
-        return 1.055 * std::pow(value, 1.0 / 2.4) - 0.055;
-    };
-
-    rf = gamma_correct(rf);
-    gf = gamma_correct(gf);
-    bf = gamma_correct(bf);
-
-    double max_value = std::max({rf, gf, bf});
-    if (max_value > 1.0) {
-        rf /= max_value;
-        gf /= max_value;
-        bf /= max_value;
-    }
-
-    if (red) {
-        *red = clamp_u8(static_cast<int>(std::lround(rf * 255.0)));
-    }
-    if (green) {
-        *green = clamp_u8(static_cast<int>(std::lround(gf * 255.0)));
-    }
-    if (blue) {
-        *blue = clamp_u8(static_cast<int>(std::lround(bf * 255.0)));
-    }
-}
-
-static void rgb_to_matter_xy(uint8_t red, uint8_t green, uint8_t blue, uint16_t *current_x, uint16_t *current_y)
-{
-    auto to_linear = [](uint8_t value) {
-        double srgb = static_cast<double>(value) / 255.0;
-        return srgb <= 0.04045 ? srgb / 12.92 : std::pow((srgb + 0.055) / 1.055, 2.4);
-    };
-
-    double r = to_linear(red);
-    double g = to_linear(green);
-    double b = to_linear(blue);
-    double x = r * 0.4124564 + g * 0.3575761 + b * 0.1804375;
-    double y = r * 0.2126729 + g * 0.7151522 + b * 0.0721750;
-    double z = r * 0.0193339 + g * 0.1191920 + b * 0.9503041;
-    double sum = x + y + z;
-
-    if (sum <= 0.000001) {
-        x = static_cast<double>(kDefaultCurrentX) / 65535.0;
-        y = static_cast<double>(kDefaultCurrentY) / 65535.0;
-        sum = 1.0;
-    }
-
-    if (current_x) {
-        *current_x = clamp_u16(static_cast<int>(std::lround((x / sum) * 65535.0)), 0, 65535);
-    }
-    if (current_y) {
-        *current_y = clamp_u16(static_cast<int>(std::lround((y / sum) * 65535.0)), 0, 65535);
-    }
-}
-
-static void color_temp_to_rgb(uint16_t mireds, uint8_t *red, uint8_t *green, uint8_t *blue)
-{
-    double kelvin = 1000000.0 / std::max<uint16_t>(mireds, 1);
-    double temp = std::clamp(kelvin / 100.0, 10.0, 400.0);
-
-    double rf;
-    double gf;
-    double bf;
-
-    if (temp <= 66.0) {
-        rf = 255.0;
-        gf = 99.4708025861 * std::log(temp) - 161.1195681661;
-        if (temp <= 19.0) {
-            bf = 0.0;
-        } else {
-            bf = 138.5177312231 * std::log(temp - 10.0) - 305.0447927307;
-        }
-    } else {
-        rf = 329.698727446 * std::pow(temp - 60.0, -0.1332047592);
-        gf = 288.1221695283 * std::pow(temp - 60.0, -0.0755148492);
-        bf = 255.0;
-    }
-
-    if (red) {
-        *red = clamp_u8(static_cast<int>(std::lround(rf)));
-    }
-    if (green) {
-        *green = clamp_u8(static_cast<int>(std::lround(gf)));
-    }
-    if (blue) {
-        *blue = clamp_u8(static_cast<int>(std::lround(bf)));
-    }
-}
-
 static void refresh_matter_hs_trackers_from_rgb(uint8_t red, uint8_t green, uint8_t blue)
 {
-    rgb_to_matter_hs(red, green, blue, &s_matter_hue, &s_matter_saturation);
+    color_rgb_to_matter_hs(red, green, blue, &s_matter_hue, &s_matter_saturation);
 }
 
 static uint32_t pseudo_random_u32(uint32_t value)
@@ -2974,8 +2822,8 @@ static void sync_matter_state_work_handler(intptr_t arg)
     uint8_t saturation = 0;
     uint16_t current_x = 0;
     uint16_t current_y = 0;
-    rgb_to_matter_hs(snapshot.red, snapshot.green, snapshot.blue, &hue, &saturation);
-    rgb_to_matter_xy(snapshot.red, snapshot.green, snapshot.blue, &current_x, &current_y);
+    color_rgb_to_matter_hs(snapshot.red, snapshot.green, snapshot.blue, &hue, &saturation);
+    color_rgb_to_matter_xy(snapshot.red, snapshot.green, snapshot.blue, &current_x, &current_y);
 
     esp_err_t err = ESP_OK;
     s_syncing_matter = true;
@@ -3148,7 +2996,7 @@ led_control_result_t led_control_apply_json(const cJSON *root, bool require_full
     clamp_state(&committed);
     s_led_state = committed;
     refresh_matter_hs_trackers_from_rgb(s_led_state.red, s_led_state.green, s_led_state.blue);
-    rgb_to_matter_xy(s_led_state.red, s_led_state.green, s_led_state.blue, &s_matter_x, &s_matter_y);
+    color_rgb_to_matter_xy(s_led_state.red, s_led_state.green, s_led_state.blue, &s_matter_x, &s_matter_y);
     if (persist_now) {
         s_persist_pending = false;
         err = save_state_to_nvs(&s_led_state);
@@ -5008,25 +4856,25 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
         updated.brightness = matter_level_to_brightness(val->val.u8);
     } else if (cluster_id == ColorControl::Id && attribute_id == ColorControl::Attributes::CurrentHue::Id) {
         s_matter_hue = val->val.u8;
-        matter_hs_to_rgb(s_matter_hue, s_matter_saturation, &updated.red, &updated.green, &updated.blue);
-        rgb_to_matter_xy(updated.red, updated.green, updated.blue, &s_matter_x, &s_matter_y);
+        color_matter_hs_to_rgb(s_matter_hue, s_matter_saturation, &updated.red, &updated.green, &updated.blue);
+        color_rgb_to_matter_xy(updated.red, updated.green, updated.blue, &s_matter_x, &s_matter_y);
     } else if (cluster_id == ColorControl::Id && attribute_id == ColorControl::Attributes::CurrentSaturation::Id) {
         s_matter_saturation = val->val.u8;
-        matter_hs_to_rgb(s_matter_hue, s_matter_saturation, &updated.red, &updated.green, &updated.blue);
-        rgb_to_matter_xy(updated.red, updated.green, updated.blue, &s_matter_x, &s_matter_y);
+        color_matter_hs_to_rgb(s_matter_hue, s_matter_saturation, &updated.red, &updated.green, &updated.blue);
+        color_rgb_to_matter_xy(updated.red, updated.green, updated.blue, &s_matter_x, &s_matter_y);
     } else if (cluster_id == ColorControl::Id && attribute_id == ColorControl::Attributes::CurrentX::Id) {
         s_matter_x = val->val.u16;
-        matter_xy_to_rgb(s_matter_x, s_matter_y, &updated.red, &updated.green, &updated.blue);
+        color_matter_xy_to_rgb(s_matter_x, s_matter_y, &updated.red, &updated.green, &updated.blue);
         refresh_matter_hs_trackers_from_rgb(updated.red, updated.green, updated.blue);
     } else if (cluster_id == ColorControl::Id && attribute_id == ColorControl::Attributes::CurrentY::Id) {
         s_matter_y = val->val.u16;
-        matter_xy_to_rgb(s_matter_x, s_matter_y, &updated.red, &updated.green, &updated.blue);
+        color_matter_xy_to_rgb(s_matter_x, s_matter_y, &updated.red, &updated.green, &updated.blue);
         refresh_matter_hs_trackers_from_rgb(updated.red, updated.green, updated.blue);
     } else if (cluster_id == ColorControl::Id && attribute_id == ColorControl::Attributes::ColorTemperatureMireds::Id) {
         s_matter_temp_mireds = val->val.u16;
-        color_temp_to_rgb(s_matter_temp_mireds, &updated.red, &updated.green, &updated.blue);
+        color_temp_mireds_to_rgb(s_matter_temp_mireds, &updated.red, &updated.green, &updated.blue);
         refresh_matter_hs_trackers_from_rgb(updated.red, updated.green, updated.blue);
-        rgb_to_matter_xy(updated.red, updated.green, updated.blue, &s_matter_x, &s_matter_y);
+        color_rgb_to_matter_xy(updated.red, updated.green, updated.blue, &s_matter_x, &s_matter_y);
     } else {
         xSemaphoreGive(s_state_mutex);
         return ESP_OK;
@@ -5049,7 +4897,7 @@ static void set_initial_matter_color_attributes()
 {
     uint8_t hue = 0;
     uint8_t saturation = 0;
-    rgb_to_matter_hs(s_led_state.red, s_led_state.green, s_led_state.blue, &hue, &saturation);
+    color_rgb_to_matter_hs(s_led_state.red, s_led_state.green, s_led_state.blue, &hue, &saturation);
     s_matter_hue = hue;
     s_matter_saturation = saturation;
 
