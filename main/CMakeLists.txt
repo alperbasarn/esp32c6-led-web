@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "app_main.cpp" "mqtt_link.cpp" "mqtt_proto.cpp" "model/color_model.cpp"
+    SRCS "app_main.cpp" "mqtt_link.cpp" "mqtt_proto.cpp" "model/color_model.cpp" "model/net_model.cpp" "model/schedule_model.cpp"
     INCLUDE_DIRS "." "include"
     PRIV_INCLUDE_DIRS "." "include" "${ESP_MATTER_PATH}/examples/common/utils"
     REQUIRES app_update esp_event esp_http_client esp_http_server esp_https_ota esp_netif esp_wifi json led_strip mbedtls mqtt nvs_flash esp_matter

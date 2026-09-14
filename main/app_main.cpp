@@ -36,6 +36,8 @@
 #include "freertos/task.h"
 #include "led_control.h"
 #include "model/color_model.h"
+#include "model/net_model.h"
+#include "model/schedule_model.h"
 #include "led_strip.h"
 #include "lwip/inet.h"
 #include "mbedtls/pk.h"
@@ -220,13 +222,6 @@ static TaskHandle_t s_auto_update_task = nullptr;
 // Time-based automatic on/off. Fixed schedules persist in NVS and require a
 // valid wall clock (SNTP). The relative one-shot timer is in-RAM only and uses
 // a monotonic esp_timer deadline so it works without any time sync.
-typedef struct {
-    uint8_t enabled;
-    uint8_t hour;
-    uint8_t minute;
-    uint8_t days;    // bitmask, bit0=Sunday .. bit6=Saturday (0x7F = every day)
-    uint8_t action;  // 0=off, 1=on
-} schedule_entry_t;
 
 static schedule_entry_t s_schedules[APP_MAX_SCHEDULES] = {};
 static char s_tz[40] = APP_TZ_DEFAULT;
@@ -835,48 +830,6 @@ static void copy_string_value(char *dest, size_t dest_size, const char *src)
     size_t copy_len = std::min(dest_size - 1, std::strlen(src));
     std::memcpy(dest, src, copy_len);
     dest[copy_len] = '\0';
-}
-
-static const char *wifi_disconnect_reason_to_text(uint16_t reason)
-{
-    switch (reason) {
-    case 0:
-        return "none";
-    case 2:
-        return "auth-expire";
-    case 3:
-        return "auth-leave";
-    case 4:
-        return "assoc-expire";
-    case 5:
-        return "assoc-too-many";
-    case 6:
-        return "not-authenticated";
-    case 7:
-        return "not-associated";
-    case 8:
-        return "assoc-leave";
-    case 15:
-        return "4way-timeout";
-    case 16:
-        return "group-key-timeout";
-    case 23:
-        return "802.1x-auth-failed";
-    case 200:
-        return "beacon-timeout";
-    case 201:
-        return "no-ap-found";
-    case 202:
-        return "auth-failed";
-    case 203:
-        return "assoc-failed";
-    case 204:
-        return "handshake-timeout";
-    case 205:
-        return "connection-failed";
-    default:
-        return "unknown";
-    }
 }
 
 typedef struct {
@@ -3215,7 +3168,7 @@ static void schedule_task(void *arg)
         uint8_t relative_action = 0;
         xSemaphoreTake(s_state_mutex, portMAX_DELAY);
         int64_t deadline = s_relative_deadline_us;
-        if (deadline != 0 && esp_timer_get_time() >= deadline) {
+        if (schedule_relative_due(deadline, esp_timer_get_time())) {
             relative_action = s_relative_action;
             s_relative_deadline_us = 0;
             relative_fire = true;
@@ -3234,8 +3187,8 @@ static void schedule_task(void *arg)
             int32_t cur_min = (int32_t)(now / 60);
             for (size_t i = 0; i < APP_MAX_SCHEDULES; ++i) {
                 schedule_entry_t entry = s_schedules[i];
-                if (entry.enabled && (entry.days & (1u << lt.tm_wday)) && entry.hour == lt.tm_hour &&
-                    entry.minute == lt.tm_min && s_sched_last_fired_min[i] != cur_min) {
+                if (schedule_entry_due(&entry, lt.tm_wday, lt.tm_hour, lt.tm_min, cur_min,
+                                       s_sched_last_fired_min[i])) {
                     s_sched_last_fired_min[i] = cur_min;
                     ESP_LOGI(TAG, "Schedule %u fired at %02d:%02d: power %s", (unsigned)i, lt.tm_hour,
                              lt.tm_min, entry.action == 1 ? "on" : "off");
@@ -3334,7 +3287,7 @@ static esp_err_t send_state_json(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "sta_rssi", s_sta_rssi);
     cJSON_AddNumberToObject(root, "sta_channel", s_sta_channel);
     cJSON_AddNumberToObject(root, "sta_last_disconnect_reason", s_sta_last_disconnect_reason);
-    cJSON_AddStringToObject(root, "sta_last_disconnect_reason_text", wifi_disconnect_reason_to_text(s_sta_last_disconnect_reason));
+    cJSON_AddStringToObject(root, "sta_last_disconnect_reason_text", net_wifi_disconnect_reason_text(s_sta_last_disconnect_reason));
     cJSON_AddNumberToObject(root, "sta_connect_count", static_cast<double>(s_sta_connect_count));
     cJSON_AddNumberToObject(root, "sta_disconnect_count", static_cast<double>(s_sta_disconnect_count));
     cJSON_AddNumberToObject(root, "sta_last_event_ms", static_cast<double>(s_sta_last_event_ms));
@@ -3367,8 +3320,7 @@ static esp_err_t send_state_json(httpd_req_t *req)
     const bool rel_active = rel_deadline != 0;
     int rel_remaining_s = 0;
     if (rel_active) {
-        int64_t rem_us = rel_deadline - esp_timer_get_time();
-        rel_remaining_s = rem_us > 0 ? static_cast<int>(rem_us / 1000000) : 0;
+        rel_remaining_s = schedule_relative_remaining_s(rel_deadline, esp_timer_get_time());
     }
     cJSON_AddBoolToObject(root, "relative_active", rel_active);
     cJSON_AddNumberToObject(root, "relative_action", rel_action);
@@ -4225,8 +4177,7 @@ static esp_err_t schedule_get_handler(httpd_req_t *req)
     const bool rel_active = rel_deadline != 0;
     int rel_remaining_s = 0;
     if (rel_active) {
-        int64_t rem_us = rel_deadline - esp_timer_get_time();
-        rel_remaining_s = rem_us > 0 ? static_cast<int>(rem_us / 1000000) : 0;
+        rel_remaining_s = schedule_relative_remaining_s(rel_deadline, esp_timer_get_time());
     }
     cJSON_AddBoolToObject(relative, "active", rel_active);
     cJSON_AddNumberToObject(relative, "action", rel_action);
