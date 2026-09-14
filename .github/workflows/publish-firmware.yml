@@ -91,6 +91,62 @@ jobs:
           grep -q '^CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y$' sdkconfig
           grep -q '^CONFIG_APP_OTA_SIG_VERIFY=y$' sdkconfig
 
+      - name: Flash headroom gate
+        shell: bash
+        env:
+          # Minimum bytes that must remain free in the smallest app partition.
+          # The linker already fails on actual overflow; this fails earlier, on
+          # the APPROACH to overflow, so a release is never cut with no room to
+          # land a hotfix. 1.11 overflowed 0x1F0000 by 1,840 bytes and nothing
+          # caught it until the final link.
+          MIN_FREE_BYTES: "8192"
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re, pathlib, sys
+
+          # Smallest app partition from partitions.csv (both OTA slots are app
+          # slots; an image has to fit whichever is smaller).
+          sizes = []
+          for line in pathlib.Path("partitions.csv").read_text().splitlines():
+              line = line.split("#", 1)[0].strip()
+              if not line:
+                  continue
+              cols = [c.strip() for c in line.split(",")]
+              if len(cols) >= 5 and cols[1] == "app":
+                  sizes.append((cols[0], int(cols[4], 0)))
+          if not sizes:
+              raise SystemExit("no app partitions found in partitions.csv")
+          name, part = min(sizes, key=lambda kv: kv[1])
+
+          app = pathlib.Path("build") / os.environ["FIRMWARE_ASSET_NAME"]
+          used = app.stat().st_size
+          free = part - used
+          floor = int(os.environ["MIN_FREE_BYTES"])
+          pct = used / part * 100
+
+          summary = (
+              f"| metric | bytes |\n|---|---:|\n"
+              f"| app partition `{name}` | {part:,} |\n"
+              f"| image | {used:,} |\n"
+              f"| free | {free:,} |\n"
+              f"| used | {pct:.2f}% |\n"
+          )
+          print(summary)
+          if (p := os.environ.get("GITHUB_STEP_SUMMARY")):
+              pathlib.Path(p).write_text("### Flash headroom\n\n" + summary, encoding="utf-8")
+
+          if free < 0:
+              raise SystemExit(f"image overflows {name} by {-free:,} bytes")
+          if free < floor:
+              raise SystemExit(
+                  f"only {free:,} bytes free in {name}, below the {floor:,}-byte floor.\n"
+                  "Reclaim space (the embedded page gzips to about a quarter of its size) "
+                  "or raise MIN_FREE_BYTES deliberately, with a reason."
+              )
+          print(f"OK: {free:,} bytes free (floor {floor:,})")
+          PY
+
       - name: Verify signing key present when OTA verify enabled
         shell: bash
         run: |
@@ -105,15 +161,39 @@ jobs:
       - name: Check sdkconfig drift
         shell: bash
         run: |
-          # NON-FAILING: sdkconfig is tracked, but a build can regenerate it with
-          # drift we cannot reconcile here (there is no clean local baseline build
-          # in CI). Emit a warning annotation only. Promote this to a hard failure
-          # (exit 1) once sdkconfig is reconciled against a clean build.
+          set -euo pipefail
+          # A build regenerates sdkconfig with incidental drift that cannot be
+          # reconciled here (there is no clean local baseline build in CI), so a
+          # blanket failure would make every run red for no good reason. Instead
+          # this is now a TARGETED gate: incidental drift stays a warning, but
+          # drift in a key that changes what is compiled in -- OTA rollback
+          # safety, signature verification, the partition layout, or the size
+          # levers the image depends on to fit -- fails the build.
+          #
+          # Rationale: the whole point of tracking sdkconfig is that a refactor
+          # cannot silently change its own build inputs. Only these keys can do
+          # that in a way that is invisible in the diff but visible on a device.
+          CRITICAL='CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE|CONFIG_APP_OTA_SIG_VERIFY|CONFIG_PARTITION_TABLE|CONFIG_ESPTOOLPY_FLASHSIZE|CONFIG_COMPILER_OPTIMIZATION|CONFIG_NEWLIB_NANO_FORMAT'
+
           git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
-          if ! git diff --quiet -- sdkconfig; then
-            git diff --stat -- sdkconfig || true
-            echo "::warning::sdkconfig drifted during build; reconcile and commit the regenerated sdkconfig"
+          if git diff --quiet -- sdkconfig; then
+            echo "sdkconfig: no drift"
+            exit 0
           fi
+
+          git diff --stat -- sdkconfig || true
+          # Changed config lines only (+/- but not the +++/--- file headers).
+          changed="$(git diff -U0 -- sdkconfig | grep -E '^[+-]CONFIG_' || true)"
+          critical_hits="$(printf '%s\n' "$changed" | grep -E "^[+-]($CRITICAL)" || true)"
+
+          if [ -n "$critical_hits" ]; then
+            echo "::error::sdkconfig drifted in a build-defining key; the committed sdkconfig no longer describes what was built"
+            printf '%s\n' "$critical_hits"
+            exit 1
+          fi
+
+          echo "::warning::sdkconfig drifted during build (no build-defining keys affected); reconcile and commit the regenerated sdkconfig"
+          printf '%s\n' "$changed" | head -40
 
       - name: Validate release version
         if: github.event_name == 'release'
