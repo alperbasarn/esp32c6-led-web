@@ -162,38 +162,106 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # A build regenerates sdkconfig with incidental drift that cannot be
+          # A build regenerates sdkconfig with incidental churn that cannot be
           # reconciled here (there is no clean local baseline build in CI), so a
-          # blanket failure would make every run red for no good reason. Instead
-          # this is now a TARGETED gate: incidental drift stays a warning, but
-          # drift in a key that changes what is compiled in -- OTA rollback
-          # safety, signature verification, the partition layout, or the size
-          # levers the image depends on to fit -- fails the build.
+          # blanket failure would make every run red for no good reason. This is
+          # a TARGETED gate: incidental drift stays a warning, but drift in a key
+          # that changes what is compiled in -- OTA rollback safety, signature
+          # verification, the partition layout, or the size levers the image
+          # depends on to fit -- fails the build.
           #
-          # Rationale: the whole point of tracking sdkconfig is that a refactor
-          # cannot silently change its own build inputs. Only these keys can do
-          # that in a way that is invisible in the diff but visible on a device.
-          CRITICAL='CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE|CONFIG_APP_OTA_SIG_VERIFY|CONFIG_PARTITION_TABLE|CONFIG_ESPTOOLPY_FLASHSIZE|CONFIG_COMPILER_OPTIMIZATION|CONFIG_NEWLIB_NANO_FORMAT'
-
+          # Rationale: the point of tracking sdkconfig is that a refactor cannot
+          # silently change its own build inputs. Only these keys can do that in
+          # a way that is invisible in the diff but visible on a device.
           git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
-          if git diff --quiet -- sdkconfig; then
-            echo "sdkconfig: no drift"
-            exit 0
-          fi
+          git show HEAD:sdkconfig > "$RUNNER_TEMP/sdkconfig.committed"
+          python3 - "$RUNNER_TEMP/sdkconfig.committed" sdkconfig <<'PY'
+          import pathlib
+          import sys
 
-          git diff --stat -- sdkconfig || true
-          # Changed config lines only (+/- but not the +++/--- file headers).
-          changed="$(git diff -U0 -- sdkconfig | grep -E '^[+-]CONFIG_' || true)"
-          critical_hits="$(printf '%s\n' "$changed" | grep -E "^[+-]($CRITICAL)" || true)"
+          # Exact key names, never prefixes. A prefix match would also sweep in
+          # the deprecated aliases at the bottom of sdkconfig, which are DERIVED
+          # from the real keys and recomputed on every build, so they carry no
+          # information about the actual configuration -- they only produce false
+          # failures when a stale committed alias is refreshed.
+          CRITICAL = {
+              "CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE",
+              "CONFIG_APP_OTA_SIG_VERIFY",
+              "CONFIG_ESPTOOLPY_FLASHSIZE",
+              "CONFIG_PARTITION_TABLE_CUSTOM",
+              "CONFIG_PARTITION_TABLE_CUSTOM_FILENAME",
+              "CONFIG_PARTITION_TABLE_FILENAME",
+              "CONFIG_PARTITION_TABLE_OFFSET",
+              "CONFIG_PARTITION_TABLE_MD5",
+              "CONFIG_COMPILER_OPTIMIZATION_SIZE",
+              "CONFIG_COMPILER_OPTIMIZATION_DEBUG",
+              "CONFIG_COMPILER_OPTIMIZATION_PERF",
+              "CONFIG_COMPILER_OPTIMIZATION_NONE",
+              "CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_ENABLE",
+              "CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT",
+              "CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_DISABLE",
+              "CONFIG_NEWLIB_NANO_FORMAT",
+          }
+          DEPRECATED_MARKER = "# Deprecated options for backward compatibility"
+          UNSET = "<unset>"
+          SUFFIX = " is not set"
 
-          if [ -n "$critical_hits" ]; then
-            echo "::error::sdkconfig drifted in a build-defining key; the committed sdkconfig no longer describes what was built"
-            printf '%s\n' "$critical_hits"
-            exit 1
-          fi
+          def parse(path):
+              """sdkconfig -> {key: value}, with an absent bool as an explicit
+              value so set-vs-unset is a comparison and not a KeyError. Stops at
+              the deprecated block; everything below it is derived."""
+              out = {}
+              for raw in pathlib.Path(path).read_text(encoding="utf-8").splitlines():
+                  line = raw.strip()
+                  if line == DEPRECATED_MARKER:
+                      break
+                  if line.startswith("CONFIG_") and "=" in line:
+                      key, _, value = line.partition("=")
+                      out[key] = value
+                  elif line.startswith("# CONFIG_") and line.endswith(SUFFIX):
+                      out[line[2:-len(SUFFIX)]] = UNSET
+              return out
 
-          echo "::warning::sdkconfig drifted during build (no build-defining keys affected); reconcile and commit the regenerated sdkconfig"
-          printf '%s\n' "$changed" | head -40
+          committed, built = (parse(p) for p in sys.argv[1:3])
+
+          # A critical key that vanished from either file means this list has gone
+          # stale (renamed or dropped upstream). Fail loudly rather than compare
+          # nothing and report success.
+          missing = sorted(k for k in CRITICAL if k not in committed or k not in built)
+          if missing:
+              print("::error::build-defining keys absent from sdkconfig; this gate's key list is stale")
+              for key in missing:
+                  where = []
+                  if key not in committed:
+                      where.append("committed")
+                  if key not in built:
+                      where.append("built")
+                  print(f"  {key}: missing from {' and '.join(where)}")
+              raise SystemExit(1)
+
+          # Compare values, not lines: a key that merely moved during regeneration
+          # is a non-event, which is what made the line-diff version cry wolf.
+          drift = sorted(k for k in committed.keys() | built.keys()
+                         if committed.get(k, UNSET) != built.get(k, UNSET))
+          critical = [k for k in drift if k in CRITICAL]
+
+          def show(keys):
+              for key in keys:
+                  print(f"  {key}: {committed.get(key, '<absent>')} -> {built.get(key, '<absent>')}")
+
+          if critical:
+              print("::error::sdkconfig drifted in a build-defining key; "
+                    "the committed sdkconfig no longer describes what was built")
+              show(critical)
+              raise SystemExit(1)
+
+          if drift:
+              print(f"::warning::sdkconfig drifted in {len(drift)} incidental key(s) during build; "
+                    "no build-defining key affected. Reconcile and commit the regenerated sdkconfig.")
+              show(drift[:40])
+          else:
+              print("sdkconfig: no drift")
+          PY
 
       - name: Validate release version
         if: github.event_name == 'release'
