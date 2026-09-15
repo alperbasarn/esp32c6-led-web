@@ -26,6 +26,8 @@ out="${TMPDIR:-/tmp}/esp32c6-led-web-host-tests"
 MODULES=(
     "mqtt_proto|1|main/mqtt_proto.cpp"
     "color_model|0|main/model/color_model.cpp"
+    "net_model|0|main/model/net_model.cpp"
+    "schedule_model|0|main/model/schedule_model.cpp"
 )
 
 want="${1:-}"
