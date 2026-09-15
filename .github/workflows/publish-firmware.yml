@@ -97,8 +97,18 @@ jobs:
           # Minimum bytes that must remain free in the smallest app partition.
           # The linker already fails on actual overflow; this fails earlier, on
           # the APPROACH to overflow, so a release is never cut with no room to
-          # land a hotfix. 1.11 overflowed 0x1F0000 by 1,840 bytes and nothing
+          # land a hotfix. A 1.11-era build did overflow 0x1F0000 -- that is why
+          # CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT exists -- and nothing
           # caught it until the final link.
+          #
+          # Two headroom figures are both real and describe different trees, so
+          # quote the tree along with the number or it means nothing:
+          #   v1.11 (tag; what main ships)  1,966,016 B -> 65,600 free, 96.77%
+          #   dev   (adds MQTT + facade + host harness)
+          #                                 2,006,144 B -> 25,472 free, 98.75%
+          # dev's is the one a refactor spends against, and it leaves only about
+          # 17 KB above this floor. Read the number this gate prints; do not
+          # carry one around.
           MIN_FREE_BYTES: "8192"
         run: |
           set -euo pipefail
