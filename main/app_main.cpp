@@ -39,6 +39,7 @@
 #include "model/net_model.h"
 #include "model/schedule_model.h"
 #include "model/led_model.h"
+#include "model/render_model.h"
 #include "model/http_encoding.h"
 #include "led_strip.h"
 #include "lwip/inet.h"
@@ -209,11 +210,6 @@ static int64_t              s_indicator_started_us = 0;
 // rather than a page -- see main/model/http_encoding.h.
 extern const uint8_t index_html_gz_start[] asm("_binary_index_html_gz_start");
 extern const uint8_t index_html_gz_end[] asm("_binary_index_html_gz_end");
-
-static inline double normalized_u8(uint8_t value)
-{
-    return static_cast<double>(value) / 255.0;
-}
 
 static void copy_string_value(char *dest, size_t dest_size, const char *src)
 {
@@ -1367,94 +1363,13 @@ static void refresh_matter_hs_trackers_from_rgb(uint8_t red, uint8_t green, uint
     color_rgb_to_matter_hs(red, green, blue, &s_matter_hue, &s_matter_saturation);
 }
 
-static uint32_t pseudo_random_u32(uint32_t value)
-{
-    value ^= value >> 16;
-    value *= 0x7feb352dU;
-    value ^= value >> 15;
-    value *= 0x846ca68bU;
-    value ^= value >> 16;
-    return value;
-}
-
-// Smooth 1-D value noise, returns 0..1, never NaN (frac always in [0,1)),
-// deterministic for negative x (floor + integer wrap). Two pseudo_random_u32
-// samples per call, no tables/libs. Used by the Fire effect. Host-testable.
-static double value_noise_1d(double x, uint32_t seed)
-{
-    double xi_f = std::floor(x);
-    uint32_t xi = static_cast<uint32_t>(static_cast<int64_t>(xi_f));
-    double frac = x - xi_f;                       // [0,1)
-    auto lattice = [&](uint32_t i) {
-        return static_cast<double>(pseudo_random_u32(i * 2654435761u + seed) & 0xffffu) / 65535.0;
-    };
-    double a = lattice(xi);
-    double b = lattice(xi + 1u);
-    double s = frac * frac * (3.0 - 2.0 * frac);  // smoothstep
-    return a + (b - a) * s;                        // [0,1]
-}
-
-static uint8_t wheel_channel(uint8_t wheel_pos, uint8_t channel)
-{
-    if (wheel_pos < 85) {
-        return channel == 0 ? static_cast<uint8_t>(255 - wheel_pos * 3)
-                            : (channel == 1 ? static_cast<uint8_t>(wheel_pos * 3) : 0);
-    }
-    if (wheel_pos < 170) {
-        wheel_pos = static_cast<uint8_t>(wheel_pos - 85);
-        return channel == 1 ? static_cast<uint8_t>(255 - wheel_pos * 3)
-                            : (channel == 2 ? static_cast<uint8_t>(wheel_pos * 3) : 0);
-    }
-    wheel_pos = static_cast<uint8_t>(wheel_pos - 170);
-    return channel == 2 ? static_cast<uint8_t>(255 - wheel_pos * 3)
-                        : (channel == 0 ? static_cast<uint8_t>(wheel_pos * 3) : 0);
-}
-
-static uint8_t float_to_u8(double value)
-{
-    return led_clamp_u8(static_cast<int>(std::lround(std::clamp(value, 0.0, 255.0))));
-}
-
 // ---- Perceptual smoothing constants ----------------------------------------
-// Gamma exponent for the output LUT. 2.2 is the perceptual sweet spot at 8-bit
-// output: it evens out the ramp (smooth premium fades) without crushing so much
-// of the low end that dim settings round to black. The LUT below additionally
-// floors every non-zero input to at least code 1, so no "on" level is ever
-// fully dark (see gamma_lut_build). Tunable one-liner.
-static constexpr double kGammaExponent = 2.2;
 // Time constant for the exponential temporal easing of brightness/color. 220 ms
 // sits inside the 180-320 ms band: 63% of a step in 220 ms, 95% in ~660 ms.
 static constexpr double kEaseTauMs = 220.0;
 // Snap epsilon: half an 8-bit LSB. Once the eased value is within half a code of
 // its target the rendered result is identical, so we snap and let the task idle.
 static constexpr double kEaseEpsilon = 0.5;
-
-// ---- Pure, ESP-free numeric helpers (host-testable with g++) ----------------
-// Fill lut[0..255] with a gamma curve: lut[i] = round(255 * (i/255)^gamma), with
-// a "video" floor -- every non-zero input maps to at least code 1 so the lowest
-// "on" brightness/colour never collapses to fully off (a black cliff on a
-// dimmable light). lut[0]==0 and lut[255]==255 still hold. No ESP headers -> this
-// is compilable and unit-testable under host g++.
-static void gamma_lut_build(uint8_t *lut, double gamma)
-{
-    if (!lut) {
-        return;
-    }
-    for (int i = 0; i < 256; ++i) {
-        double normalized = static_cast<double>(i) / 255.0;
-        long code = std::lround(255.0 * std::pow(normalized, gamma));
-        if (code < 0) {
-            code = 0;
-        } else if (code > 255) {
-            code = 255;
-        }
-        // Keep any lit input lit: a positive command must emit some light.
-        if (i > 0 && code == 0) {
-            code = 1;
-        }
-        lut[i] = static_cast<uint8_t>(code);
-    }
-}
 
 // Exponential smoothing factor for a measured frame delta: 1 - exp(-dt/tau).
 static double ease_alpha(double dt_ms, double tau_ms)
@@ -1476,201 +1391,7 @@ static double ease_step(double cur, double tgt, double alpha)
 // exponent. Call once at boot before the first render.
 static void init_gamma_lut(void)
 {
-    gamma_lut_build(s_gamma_lut, kGammaExponent);
-}
-
-static uint32_t effect_cycle_ms_from_value(uint8_t value, uint32_t slow_ms, uint32_t fast_ms)
-{
-    double speed = normalized_u8(std::max<uint8_t>(1, value));
-    double interpolated = static_cast<double>(slow_ms) - (static_cast<double>(slow_ms - fast_ms) * speed);
-    return std::max<uint32_t>(fast_ms, static_cast<uint32_t>(std::lround(interpolated)));
-}
-
-static void render_effect_pixel(const led_state_t *state, uint16_t index, uint32_t now_ms,
-                                uint8_t *out_red, uint8_t *out_green, uint8_t *out_blue)
-{
-    if (!state || !out_red || !out_green || !out_blue || !state->power || state->brightness == 0 || index >= state->count) {
-        if (out_red) {
-            *out_red = 0;
-        }
-        if (out_green) {
-            *out_green = 0;
-        }
-        if (out_blue) {
-            *out_blue = 0;
-        }
-        return;
-    }
-
-    double brightness_scale = static_cast<double>(state->brightness) / 255.0;
-    double red = static_cast<double>(state->red);
-    double green = static_cast<double>(state->green);
-    double blue = static_cast<double>(state->blue);
-    uint16_t active_count = std::max<uint16_t>(state->count, 1);
-    const effect_params_t &params = state->effect_profiles[state->effect];
-
-    switch (state->effect) {
-    case LED_EFFECT_GLOW: {
-        double floor = 0.03 + normalized_u8(params.values[1]) * 0.62;
-        double depth = 0.12 + normalized_u8(params.values[2]) * 0.88;
-        uint32_t cycle = effect_cycle_ms_from_value(params.values[0], 3200U, 600U);
-        double phase = (static_cast<double>(now_ms % cycle) / static_cast<double>(cycle)) * 2.0 * M_PI;
-        double pulse = floor + (1.0 - floor) * (((std::sin(phase) + 1.0) * 0.5) * depth);
-        brightness_scale *= pulse;
-        break;
-    }
-    case LED_EFFECT_RAINBOW: {
-        uint32_t cycle = effect_cycle_ms_from_value(params.values[0], 6000U, 450U);
-        double length_leds = 2.0 + normalized_u8(params.values[1]) * std::max<double>(8.0, static_cast<double>(active_count) * 3.0);
-        double travel_leds = (static_cast<double>(now_ms % cycle) / static_cast<double>(cycle)) * length_leds;
-        double start_offset = normalized_u8(params.values[3]) * 255.0;
-        double wheel_position = std::fmod((((static_cast<double>(index) + travel_leds) / length_leds) * 255.0) + start_offset, 256.0);
-        if (wheel_position < 0.0) {
-            wheel_position += 256.0;
-        }
-        uint8_t wheel_pos = static_cast<uint8_t>(wheel_position);
-        double rainbow_mix = normalized_u8(params.values[2]);
-        double contrast = normalized_u8(params.values[4]);
-        double wave_phase = (((static_cast<double>(index) + travel_leds) / length_leds) * 2.0 * M_PI) +
-                            (normalized_u8(params.values[3]) * 2.0 * M_PI);
-        double rainbow_wave = 0.5 + 0.5 * std::sin(wave_phase);
-        double contrast_scale = (1.0 - contrast) + contrast * rainbow_wave;
-        red = red * (1.0 - rainbow_mix) + wheel_channel(wheel_pos, 0) * rainbow_mix;
-        green = green * (1.0 - rainbow_mix) + wheel_channel(wheel_pos, 1) * rainbow_mix;
-        blue = blue * (1.0 - rainbow_mix) + wheel_channel(wheel_pos, 2) * rainbow_mix;
-        brightness_scale *= 0.3 + contrast_scale * 0.7;
-        break;
-    }
-    case LED_EFFECT_CHASE: {
-        uint32_t cycle = effect_cycle_ms_from_value(params.values[0], 4200U, 260U);      // ms per full loop
-        double head = std::fmod(static_cast<double>(now_ms) / static_cast<double>(cycle), 1.0)
-                      * static_cast<double>(active_count);                                // continuous 0..active_count
-
-        // continuous distance measured backward from the head (tail trails behind)
-        double behind = std::fmod(static_cast<double>(head) - static_cast<double>(index)
-                                  + static_cast<double>(active_count), static_cast<double>(active_count));
-
-        double tail_len   = 1.0 + normalized_u8(params.values[1]) * 14.0;                 // pixels, continuous
-        double sharpness  = 0.5 + normalized_u8(params.values[2]) * 3.5;
-
-        double trail = 0.0;
-        if (behind <= tail_len) {
-            double f = 1.0 - behind / tail_len;                                          // 1 at head -> 0 at tail end
-            trail = std::pow(std::clamp(f, 0.0, 1.0), sharpness);
-        }
-        // anti-alias the leading edge: the pixel just AHEAD of a sub-pixel head
-        double ahead = static_cast<double>(active_count) - behind;
-        if (ahead < 1.0) {
-            trail = std::max(trail, std::pow(1.0 - ahead, sharpness));
-        }
-        brightness_scale *= trail;
-        break;
-    }
-    case LED_EFFECT_SPARKLE: {
-        double density = normalized_u8(params.values[0]);
-        double base    = normalized_u8(params.values[1]) * 0.35;
-
-        uint32_t h      = pseudo_random_u32(index * 2654435761u);
-        double   offset = static_cast<double>(h & 0xffffu) / 65535.0;                    // phase 0..1
-        double   rate   = 0.5 + static_cast<double>((h >> 16) & 0xffffu) / 65535.0 * 1.5; // 0.5..2.0
-
-        uint32_t cycle = effect_cycle_ms_from_value(params.values[2], 2600U, 500U);       // full twinkle period
-        double phase = std::fmod(static_cast<double>(now_ms) / static_cast<double>(cycle) * rate + offset, 1.0);
-        double env   = 0.5 - 0.5 * std::cos(phase * 2.0 * M_PI);                          // [0,1] smooth
-        env = std::pow(env, 1.5);                                                          // crisper peak, soft tail
-
-        uint32_t g   = pseudo_random_u32(index * 40503u + 7u);
-        double   gate = static_cast<double>(g & 0xffffu) / 65535.0;
-        double   active = (gate < (0.15 + density * 0.85)) ? 1.0 : 0.0;
-
-        double level = base + (1.0 - base) * (env * active);   // inactive -> base; active twinkles base..1
-        red   = static_cast<double>(state->effect_colors[LED_EFFECT_SPARKLE].red);
-        green = static_cast<double>(state->effect_colors[LED_EFFECT_SPARKLE].green);
-        blue  = static_cast<double>(state->effect_colors[LED_EFFECT_SPARKLE].blue);
-        brightness_scale *= level;
-        break;
-    }
-    case LED_EFFECT_WAVE: {
-        uint32_t cycle = effect_cycle_ms_from_value(params.values[0], 3600U, 550U);
-        double phase = (static_cast<double>(now_ms % cycle) / static_cast<double>(cycle)) * 2.0 * M_PI;
-        double wavelength = 0.7 + normalized_u8(params.values[1]) * 6.3;
-        double position = (static_cast<double>(index) / active_count) * 2.0 * M_PI * wavelength;
-        double depth = normalized_u8(params.values[2]);
-        double floor = 0.05 + (1.0 - depth) * 0.55;
-        double wave = floor + (1.0 - floor) * ((std::sin(phase - position) + 1.0) * 0.5);
-        brightness_scale *= wave;
-        break;
-    }
-    case LED_EFFECT_FIRE: {
-        double t     = static_cast<double>(now_ms) / 1000.0;                 // seconds
-        double flow  = 0.4 + normalized_u8(params.values[2]) * 3.0;          // cells/sec, >0
-        double scale = 0.15 + normalized_u8(params.values[3]) * 1.20;        // spatial freq, >0
-
-        // Two-octave scrolling heat field (flows along the strip over time)
-        double n1 = value_noise_1d(index * scale        - t * flow,        0x1000u);
-        double n2 = value_noise_1d(index * scale * 2.7   - t * flow * 1.9,  0x2000u);
-        double heat = n1 * 0.65 + n2 * 0.35;                                 // [0,1]
-
-        // Cooling shifts the whole field down toward black
-        heat -= normalized_u8(params.values[0]) * 0.45;
-
-        // Sparse bright embers (deterministic per pixel + coarse time bucket)
-        double spark_prob = normalized_u8(params.values[1]);
-        uint32_t sbucket  = static_cast<uint32_t>(t * (2.0 + flow * 4.0));
-        uint32_t sr       = pseudo_random_u32(index * 40503u + sbucket * 668265263u);
-        double   s0       = static_cast<double>(sr & 0xffffu) / 65535.0;
-        if (s0 < spark_prob * 0.10) {
-            heat += 0.5 + 0.5 * (static_cast<double>((sr >> 16) & 0xffffu) / 65535.0);
-        }
-        heat = std::clamp(heat, 0.0, 1.0);
-
-        // HeatColor-style palette: black -> red -> orange -> yellow -> white
-        double warm = 0.5 + normalized_u8(params.values[4]) * 0.9;           // 0.5..1.4
-        double h3 = heat * 3.0;
-        red   = std::clamp(h3,               0.0, 1.0) * 255.0;
-        green = std::clamp((h3 - 1.0) * warm, 0.0, 1.0) * 255.0;
-        blue  = std::clamp((h3 - 2.0) * warm, 0.0, 1.0) * 255.0;
-        // brightness_scale (master) left as-is; low heat is dark via the palette itself
-        break;
-    }
-    case LED_EFFECT_AURORA: {
-        double t     = static_cast<double>(now_ms) / 1000.0;
-        double drift = 0.02 + normalized_u8(params.values[0]) * 0.30;        // cycles/sec (slow)
-        double scale = 0.20 + normalized_u8(params.values[1]) * 2.00;
-        double idx_n = static_cast<double>(index) / active_count;            // [0,1), active_count>=1
-
-        // Organic drifting hue field from two out-of-phase slow waves
-        double p1 = std::sin((idx_n * scale * 2.0 * M_PI)        + t * drift * 2.0 * M_PI);
-        double p2 = std::sin((idx_n * scale * M_PI * 1.7)        - t * drift * 4.1);
-        double field = p1 * 0.6 + p2 * 0.4;                                   // [-1,1]
-
-        double hue = normalized_u8(params.values[3]) + field * (normalized_u8(params.values[4]) * 0.5);
-        hue -= std::floor(hue);                                               // wrap to [0,1)
-        uint8_t wheel_pos = static_cast<uint8_t>(hue * 255.0);
-
-        double sat = normalized_u8(params.values[2]);
-        red   = wheel_channel(wheel_pos, 0) * sat + 255.0 * (1.0 - sat);
-        green = wheel_channel(wheel_pos, 1) * sat + 255.0 * (1.0 - sat);
-        blue  = wheel_channel(wheel_pos, 2) * sat + 255.0 * (1.0 - sat);
-
-        // Soft luminance breathing with an ambient floor (0.55..1.0)
-        double bfield = 0.5 + 0.5 * std::sin((idx_n * scale * 2.0 * 2.0 * M_PI) - t * drift * 3.3);
-        brightness_scale *= 0.55 + 0.45 * bfield;
-        break;
-    }
-    case LED_EFFECT_SOLID:
-    default:
-        break;
-    }
-
-    // Apply gamma last, per channel, on the composed linear light intent
-    // (channel x brightness_scale). This folds effect brightness modulation and
-    // the temporally-eased brightness/color into a single gamma pass, giving a
-    // perceptually even ramp. s_gamma_lut[0]==0, so the black early-return above
-    // stays consistent.
-    *out_red = s_gamma_lut[float_to_u8(red * brightness_scale)];
-    *out_green = s_gamma_lut[float_to_u8(green * brightness_scale)];
-    *out_blue = s_gamma_lut[float_to_u8(blue * brightness_scale)];
+    render_gamma_lut_build(s_gamma_lut, kRenderGammaExponent);
 }
 
 static esp_err_t apply_led_state(const led_state_t *state)
@@ -1691,7 +1412,7 @@ static esp_err_t apply_led_state(const led_state_t *state)
         uint8_t red = 0;
         uint8_t green = 0;
         uint8_t blue = 0;
-        render_effect_pixel(state, i, now_ms, &red, &green, &blue);
+        render_effect_pixel(state, s_gamma_lut, i, now_ms, &red, &green, &blue);
         err = led_strip_set_pixel(s_led_strip, i, red, green, blue);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "set pixel failed: %s", esp_err_to_name(err));
@@ -3480,10 +3201,10 @@ static void effect_task(void *arg)
         // snapshot itself stays the TARGET for the wake decision and is what
         // Matter reads elsewhere; the eased values are display-only.
         led_state_t render_state = snapshot;
-        render_state.brightness = float_to_u8(s_disp_brightness);
-        render_state.red = float_to_u8(s_disp_r);
-        render_state.green = float_to_u8(s_disp_g);
-        render_state.blue = float_to_u8(s_disp_b);
+        render_state.brightness = render_float_to_u8(s_disp_brightness);
+        render_state.red = render_float_to_u8(s_disp_r);
+        render_state.green = render_float_to_u8(s_disp_g);
+        render_state.blue = render_float_to_u8(s_disp_b);
         // Derive power from the DISPLAYED brightness so a power-off fade keeps
         // rendering frames until it truly reaches 0 (where render_effect_pixel's
         // brightness==0 guard yields black -- the settled off state).
