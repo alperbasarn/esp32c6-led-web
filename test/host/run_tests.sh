@@ -28,6 +28,7 @@ MODULES=(
     "color_model|0|main/model/color_model.cpp"
     "net_model|0|main/model/net_model.cpp"
     "schedule_model|0|main/model/schedule_model.cpp"
+    "led_model|0|main/model/led_model.cpp"
     "http_encoding|0|main/model/http_encoding.cpp"
 )
 
