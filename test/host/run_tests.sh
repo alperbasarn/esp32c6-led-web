@@ -30,6 +30,7 @@ MODULES=(
     "schedule_model|0|main/model/schedule_model.cpp"
     "led_model|0|main/model/led_model.cpp"
     "render_model|0|main/model/render_model.cpp main/model/led_model.cpp"
+    "led_ease|0|main/model/led_ease.cpp"
     "http_encoding|0|main/model/http_encoding.cpp"
 )
 
