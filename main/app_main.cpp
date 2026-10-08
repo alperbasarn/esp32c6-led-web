@@ -40,6 +40,7 @@
 #include "model/schedule_model.h"
 #include "model/led_model.h"
 #include "model/render_model.h"
+#include "model/led_ease.h"
 #include "model/http_encoding.h"
 #include "led_strip.h"
 #include "lwip/inet.h"
@@ -1361,30 +1362,6 @@ static uint8_t matter_level_to_brightness(uint8_t level)
 static void refresh_matter_hs_trackers_from_rgb(uint8_t red, uint8_t green, uint8_t blue)
 {
     color_rgb_to_matter_hs(red, green, blue, &s_matter_hue, &s_matter_saturation);
-}
-
-// ---- Perceptual smoothing constants ----------------------------------------
-// Time constant for the exponential temporal easing of brightness/color. 220 ms
-// sits inside the 180-320 ms band: 63% of a step in 220 ms, 95% in ~660 ms.
-static constexpr double kEaseTauMs = 220.0;
-// Snap epsilon: half an 8-bit LSB. Once the eased value is within half a code of
-// its target the rendered result is identical, so we snap and let the task idle.
-static constexpr double kEaseEpsilon = 0.5;
-
-// Exponential smoothing factor for a measured frame delta: 1 - exp(-dt/tau).
-static double ease_alpha(double dt_ms, double tau_ms)
-{
-    if (tau_ms <= 0.0) {
-        return 1.0;
-    }
-    return 1.0 - std::exp(-dt_ms / tau_ms);
-}
-
-// One easing step toward a target: cur + (tgt - cur) * alpha. Monotonic, never
-// overshoots for alpha in [0,1].
-static double ease_step(double cur, double tgt, double alpha)
-{
-    return cur + (tgt - cur) * alpha;
 }
 
 // Firmware wrapper: populate the file-scope gamma LUT from the configured
@@ -3166,35 +3143,21 @@ static void effect_task(void *arg)
 
         // Measured-dt easing: an early notify wake advances the fade only by its
         // true elapsed time, so rapid mid-fade state changes stay time-correct
-        // instead of over-easing. Cap the delta near one frame period: after the
-        // task has blocked idle (settled -> portMAX_DELAY) the raw delta is the
-        // whole idle gap, and without this cap the first frame of a fresh fade
-        // (e.g. a SOLID brightness drag or power on/off from rest) would jump most
-        // of the way to the target -- the hard step easing exists to remove. 60 ms
-        // passes normal ~40 ms frame jitter through untouched.
+        // instead of over-easing. The delta is capped inside led_ease_advance();
+        // see kLedEaseMaxDtMs for why that cap is load-bearing rather than
+        // hygiene. The tick measurement and the eased storage stay here because
+        // they are the task's, not the rule's.
         TickType_t now = xTaskGetTickCount();
         double dt_ms = static_cast<double>((now - s_disp_last_tick) * portTICK_PERIOD_MS);
-        dt_ms = std::clamp(dt_ms, 1.0, 60.0);
         s_disp_last_tick = now;
-        double alpha = ease_alpha(dt_ms, kEaseTauMs);
-        s_disp_brightness = ease_step(s_disp_brightness, bri_target, alpha);
-        s_disp_r = ease_step(s_disp_r, r_target, alpha);
-        s_disp_g = ease_step(s_disp_g, g_target, alpha);
-        s_disp_b = ease_step(s_disp_b, b_target, alpha);
 
-        // Snap when within half an 8-bit code of every target so the render is
-        // exact and the task can stop spinning.
-        bool settled =
-            std::fabs(s_disp_brightness - bri_target) < kEaseEpsilon &&
-            std::fabs(s_disp_r - r_target) < kEaseEpsilon &&
-            std::fabs(s_disp_g - g_target) < kEaseEpsilon &&
-            std::fabs(s_disp_b - b_target) < kEaseEpsilon;
-        if (settled) {
-            s_disp_brightness = bri_target;
-            s_disp_r = r_target;
-            s_disp_g = g_target;
-            s_disp_b = b_target;
-        }
+        led_ease_rgb_t eased = {s_disp_brightness, s_disp_r, s_disp_g, s_disp_b};
+        const led_ease_rgb_t ease_target = {bri_target, r_target, g_target, b_target};
+        bool settled = led_ease_advance(&eased, &ease_target, dt_ms, kLedEaseTauMs);
+        s_disp_brightness = eased.brightness;
+        s_disp_r = eased.red;
+        s_disp_g = eased.green;
+        s_disp_b = eased.blue;
 
         // Build a render_state copy of the snapshot (effect, params, count come
         // straight through -- NOT eased) and override only the eased fields.
@@ -3208,7 +3171,7 @@ static void effect_task(void *arg)
         // Derive power from the DISPLAYED brightness so a power-off fade keeps
         // rendering frames until it truly reaches 0 (where render_effect_pixel's
         // brightness==0 guard yields black -- the settled off state).
-        render_state.power = (render_state.brightness >= 1);
+        render_state.power = led_ease_power_from_brightness(render_state.brightness);
 
         esp_err_t err = apply_led_state(&render_state);
         if (err != ESP_OK) {
