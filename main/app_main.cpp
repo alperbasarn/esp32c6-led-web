@@ -38,6 +38,7 @@
 #include "model/color_model.h"
 #include "model/net_model.h"
 #include "model/schedule_model.h"
+#include "model/led_model.h"
 #include "model/http_encoding.h"
 #include "led_strip.h"
 #include "lwip/inet.h"
@@ -63,12 +64,6 @@
 
 #define APP_LED_GPIO             CONFIG_APP_LED_GPIO
 #define APP_LED_MAX_PIXELS       CONFIG_APP_LED_MAX_PIXELS
-#define APP_LED_DEFAULT_COUNT    8
-#define APP_LED_DEFAULT_RED      255
-#define APP_LED_DEFAULT_GREEN    96
-#define APP_LED_DEFAULT_BLUE     32
-#define APP_LED_DEFAULT_BRIGHT   96
-#define APP_LED_DEFAULT_POWER    0
 #define APP_NVS_NAMESPACE        "led_cfg"
 #define APP_POST_BODY_LIMIT      1024
 #define APP_OTA_CHUNK_SIZE       4096
@@ -98,67 +93,9 @@
 static const char *TAG = "matter_led";
 static constexpr auto kCommissioningTimeoutSeconds = 300;
 static constexpr uint16_t kDefaultColorTempMireds = 0x00fa;
-static constexpr size_t kEffectParamSlotCount = 5;
 
 using namespace esp_matter;
 using namespace chip::app::Clusters;
-
-typedef enum {
-    LED_EFFECT_SOLID = 0,
-    LED_EFFECT_GLOW,
-    LED_EFFECT_RAINBOW,
-    LED_EFFECT_CHASE,
-    LED_EFFECT_SPARKLE,
-    LED_EFFECT_WAVE,
-    LED_EFFECT_FIRE,
-    LED_EFFECT_AURORA,
-    LED_EFFECT_COUNT,
-} led_effect_t;
-
-typedef struct {
-    const char *label;
-    uint8_t min_value;
-    uint8_t max_value;
-    uint8_t default_value;
-} effect_param_spec_t;
-
-typedef struct {
-    uint8_t param_count;
-    effect_param_spec_t params[kEffectParamSlotCount];
-} effect_spec_t;
-
-typedef struct {
-    uint8_t values[kEffectParamSlotCount];
-} effect_params_t;
-
-typedef struct {
-    uint8_t red;
-    uint8_t green;
-    uint8_t blue;
-} effect_color_t;
-
-typedef struct {
-    uint16_t count;
-    uint8_t red;
-    uint8_t green;
-    uint8_t blue;
-    uint8_t brightness;
-    bool power;
-    uint8_t effect;
-    effect_params_t effect_profiles[LED_EFFECT_COUNT];
-    effect_color_t effect_colors[LED_EFFECT_COUNT];
-} led_state_t;
-
-static const effect_spec_t kEffectSpecs[LED_EFFECT_COUNT] = {
-    {0, {{"", 0, 0, 0}, {"", 0, 0, 0}, {"", 0, 0, 0}, {"", 0, 0, 0}, {"", 0, 0, 0}}},
-    {3, {{"Pulse Speed", 1, 255, 140}, {"Glow Floor", 0, 255, 72}, {"Pulse Depth", 0, 255, 180}, {"", 0, 0, 0}, {"", 0, 0, 0}}},
-    {5, {{"Drift Speed", 1, 255, 120}, {"Rainbow Length", 1, 255, 96}, {"Color Blend", 0, 255, 220}, {"Start Offset", 0, 255, 0}, {"Contrast", 0, 255, 96}}},
-    {3, {{"Chase Speed", 1, 255, 175}, {"Tail Length", 1, 255, 90}, {"Tail Sharpness", 0, 255, 170}, {"", 0, 0, 0}, {"", 0, 0, 0}}},
-    {3, {{"Spark Density", 1, 255, 180}, {"Base Glow", 0, 255, 60}, {"Twinkle Speed", 1, 255, 170}, {"", 0, 0, 0}, {"", 0, 0, 0}}},
-    {3, {{"Wave Speed", 1, 255, 110}, {"Wavelength", 1, 255, 110}, {"Wave Depth", 0, 255, 190}, {"", 0, 0, 0}, {"", 0, 0, 0}}},
-    {5, {{"Cooling", 0, 255, 90}, {"Sparking", 0, 255, 120}, {"Flame Speed", 1, 255, 150}, {"Flame Height", 1, 255, 120}, {"Warmth", 0, 255, 160}}},
-    {5, {{"Drift Speed", 1, 255, 70}, {"Color Scale", 1, 255, 110}, {"Saturation", 0, 255, 210}, {"Hue Center", 0, 255, 150}, {"Hue Spread", 0, 255, 90}}},
-};
 
 static led_strip_handle_t s_led_strip = nullptr;
 static SemaphoreHandle_t s_state_mutex = nullptr;
@@ -168,12 +105,12 @@ static SemaphoreHandle_t s_ota_mutex = nullptr;
 static httpd_handle_t s_http_server = nullptr;
 static esp_netif_t *s_ap_netif = nullptr;
 static led_state_t s_led_state = {
-    APP_LED_DEFAULT_COUNT,
-    APP_LED_DEFAULT_RED,
-    APP_LED_DEFAULT_GREEN,
-    APP_LED_DEFAULT_BLUE,
-    APP_LED_DEFAULT_BRIGHT,
-    APP_LED_DEFAULT_POWER != 0,
+    kLedDefaultCount,
+    kLedDefaultRed,
+    kLedDefaultGreen,
+    kLedDefaultBlue,
+    kLedDefaultBrightness,
+    kLedDefaultPower,
     LED_EFFECT_SOLID,
 };
 static uint16_t s_last_render_count = 0;
@@ -273,81 +210,9 @@ static int64_t              s_indicator_started_us = 0;
 extern const uint8_t index_html_gz_start[] asm("_binary_index_html_gz_start");
 extern const uint8_t index_html_gz_end[] asm("_binary_index_html_gz_end");
 
-static inline uint8_t clamp_u8(int value)
-{
-    return static_cast<uint8_t>(std::clamp(value, 0, 255));
-}
-
-static inline uint16_t clamp_u16(int value, int min_value, int max_value)
-{
-    return static_cast<uint16_t>(std::clamp(value, min_value, max_value));
-}
-
 static inline double normalized_u8(uint8_t value)
 {
     return static_cast<double>(value) / 255.0;
-}
-
-static inline uint8_t effect_from_index(int value)
-{
-    return static_cast<uint8_t>(std::clamp(value, 0, static_cast<int>(LED_EFFECT_COUNT) - 1));
-}
-
-static const effect_spec_t &get_effect_spec(uint8_t effect)
-{
-    return kEffectSpecs[effect_from_index(effect)];
-}
-
-static const char *effect_to_name(uint8_t effect)
-{
-    switch (effect) {
-    case LED_EFFECT_GLOW:
-        return "glow";
-    case LED_EFFECT_RAINBOW:
-        return "rainbow";
-    case LED_EFFECT_CHASE:
-        return "chase";
-    case LED_EFFECT_SPARKLE:
-        return "sparkle";
-    case LED_EFFECT_WAVE:
-        return "wave";
-    case LED_EFFECT_FIRE:
-        return "fire";
-    case LED_EFFECT_AURORA:
-        return "aurora";
-    case LED_EFFECT_SOLID:
-    default:
-        return "solid";
-    }
-}
-
-static uint8_t effect_from_name(const char *effect_name)
-{
-    if (!effect_name) {
-        return LED_EFFECT_SOLID;
-    }
-    if (std::strcmp(effect_name, "glow") == 0) {
-        return LED_EFFECT_GLOW;
-    }
-    if (std::strcmp(effect_name, "rainbow") == 0) {
-        return LED_EFFECT_RAINBOW;
-    }
-    if (std::strcmp(effect_name, "chase") == 0) {
-        return LED_EFFECT_CHASE;
-    }
-    if (std::strcmp(effect_name, "sparkle") == 0) {
-        return LED_EFFECT_SPARKLE;
-    }
-    if (std::strcmp(effect_name, "wave") == 0) {
-        return LED_EFFECT_WAVE;
-    }
-    if (std::strcmp(effect_name, "fire") == 0) {
-        return LED_EFFECT_FIRE;
-    }
-    if (std::strcmp(effect_name, "aurora") == 0) {
-        return LED_EFFECT_AURORA;
-    }
-    return LED_EFFECT_SOLID;
 }
 
 static void copy_string_value(char *dest, size_t dest_size, const char *src)
@@ -1463,56 +1328,6 @@ static bool matter_is_ready()
     return esp_matter::is_started() && s_light_endpoint_id != 0;
 }
 
-static void reset_effect_profiles_to_defaults(led_state_t *state)
-{
-    if (!state) {
-        return;
-    }
-
-    for (uint8_t effect = 0; effect < LED_EFFECT_COUNT; ++effect) {
-        const effect_spec_t &spec = get_effect_spec(effect);
-        for (size_t index = 0; index < kEffectParamSlotCount; ++index) {
-            state->effect_profiles[effect].values[index] = index < spec.param_count ? spec.params[index].default_value : 0;
-        }
-    }
-}
-
-static void reset_effect_colors_to_defaults(led_state_t *state)
-{
-    if (!state) {
-        return;
-    }
-
-    for (uint8_t effect = 0; effect < LED_EFFECT_COUNT; ++effect) {
-        state->effect_colors[effect].red = APP_LED_DEFAULT_RED;
-        state->effect_colors[effect].green = APP_LED_DEFAULT_GREEN;
-        state->effect_colors[effect].blue = APP_LED_DEFAULT_BLUE;
-    }
-
-    state->effect_colors[LED_EFFECT_SPARKLE].red = 255;
-    state->effect_colors[LED_EFFECT_SPARKLE].green = 255;
-    state->effect_colors[LED_EFFECT_SPARKLE].blue = 255;
-}
-
-static void clamp_effect_profile(uint8_t effect, effect_params_t *profile)
-{
-    if (!profile) {
-        return;
-    }
-
-    const effect_spec_t &spec = get_effect_spec(effect);
-    for (size_t index = 0; index < kEffectParamSlotCount; ++index) {
-        if (index < spec.param_count) {
-            profile->values[index] = static_cast<uint8_t>(
-                std::clamp(static_cast<int>(profile->values[index]),
-                           static_cast<int>(spec.params[index].min_value),
-                           static_cast<int>(spec.params[index].max_value)));
-        } else {
-            profile->values[index] = 0;
-        }
-    }
-}
-
 static bool ap_config_restart_required()
 {
     return std::strcmp(s_ap_ssid, s_runtime_ap_ssid) != 0 || std::strcmp(s_ap_password, s_runtime_ap_password) != 0;
@@ -1535,18 +1350,6 @@ static bool validate_ap_credentials(const char *ssid, const char *password)
     }
 
     return true;
-}
-
-static void clamp_state(led_state_t *state)
-{
-    if (!state) {
-        return;
-    }
-    state->count = clamp_u16(state->count, 1, APP_LED_MAX_PIXELS);
-    state->effect = effect_from_index(state->effect);
-    for (uint8_t effect = 0; effect < LED_EFFECT_COUNT; ++effect) {
-        clamp_effect_profile(effect, &state->effect_profiles[effect]);
-    }
 }
 
 static uint8_t brightness_to_matter_level(uint8_t brightness)
@@ -1609,7 +1412,7 @@ static uint8_t wheel_channel(uint8_t wheel_pos, uint8_t channel)
 
 static uint8_t float_to_u8(double value)
 {
-    return clamp_u8(static_cast<int>(std::lround(std::clamp(value, 0.0, 255.0))));
+    return led_clamp_u8(static_cast<int>(std::lround(std::clamp(value, 0.0, 255.0))));
 }
 
 // ---- Perceptual smoothing constants ----------------------------------------
@@ -2009,7 +1812,7 @@ static bool load_state_from_nvs()
     nvs_handle_t nvs_handle = 0;
     char key[16];
     if (nvs_open(APP_NVS_NAMESPACE, NVS_READONLY, &nvs_handle) != ESP_OK) {
-        clamp_state(&s_led_state);
+        led_clamp_state(&s_led_state, APP_LED_MAX_PIXELS);
         refresh_matter_hs_trackers_from_rgb(s_led_state.red, s_led_state.green, s_led_state.blue);
         return false;
     }
@@ -2066,7 +1869,7 @@ static bool load_state_from_nvs()
     s_matter_y = matter_y;
     s_matter_temp_mireds = matter_temp;
     set_auto_install_enabled(auto_install != 0);
-    clamp_state(&s_led_state);
+    led_clamp_state(&s_led_state, APP_LED_MAX_PIXELS);
     refresh_matter_hs_trackers_from_rgb(s_led_state.red, s_led_state.green, s_led_state.blue);
     return true;
 }
@@ -2433,19 +2236,19 @@ led_control_result_t led_control_apply_json(const cJSON *root, bool require_full
     // LED "count" is a Configuration item, settable only via the SoftAP-gated
     // /api/config. Neither this path nor the MQTT link parses or applies it.
     if (brightness) {
-        updated.brightness = clamp_u8(static_cast<int>(brightness->valuedouble));
+        updated.brightness = led_clamp_u8(static_cast<int>(brightness->valuedouble));
     }
     if (color && !parse_hex_color(color->valuestring, &updated.red, &updated.green, &updated.blue)) {
         return LED_CONTROL_ERR_COLOR;
     }
     if (effect) {
-        updated.effect = effect_from_name(effect->valuestring);
+        updated.effect = led_effect_from_name(effect->valuestring);
     }
     if (effect_params) {
         for (size_t index = 0; index < kEffectParamSlotCount; ++index) {
             const cJSON *item = cJSON_GetArrayItem(effect_params, index);
             if (cJSON_IsNumber(item)) {
-                updated.effect_profiles[updated.effect].values[index] = clamp_u8(static_cast<int>(item->valuedouble));
+                updated.effect_profiles[updated.effect].values[index] = led_clamp_u8(static_cast<int>(item->valuedouble));
             }
         }
     }
@@ -2454,14 +2257,14 @@ led_control_result_t led_control_apply_json(const cJSON *root, bool require_full
                          &updated.effect_colors[updated.effect].green, &updated.effect_colors[updated.effect].blue)) {
         return LED_CONTROL_ERR_EFFECT_COLOR;
     }
-    clamp_effect_profile(updated.effect, &updated.effect_profiles[updated.effect]);
+    led_clamp_effect_profile(updated.effect, &updated.effect_profiles[updated.effect]);
     if (power) {
         updated.power = cJSON_IsTrue(power);
     } else if (brightness) {
         // Same rule as the web page: a brightness-only change carries power.
         updated.power = updated.brightness > 0;
     }
-    clamp_state(&updated);
+    led_clamp_state(&updated, APP_LED_MAX_PIXELS);
     const bool effect_color_present = effect_color != nullptr;
     const bool effect_params_present = effect_params != nullptr;
 
@@ -2480,7 +2283,7 @@ led_control_result_t led_control_apply_json(const cJSON *root, bool require_full
     if (effect_color_present) {
         committed.effect_colors[updated.effect] = updated.effect_colors[updated.effect];
     }
-    clamp_state(&committed);
+    led_clamp_state(&committed, APP_LED_MAX_PIXELS);
     s_led_state = committed;
     refresh_matter_hs_trackers_from_rgb(s_led_state.red, s_led_state.green, s_led_state.blue);
     color_rgb_to_matter_xy(s_led_state.red, s_led_state.green, s_led_state.blue, &s_matter_x, &s_matter_y);
@@ -2533,8 +2336,8 @@ void led_control_get_tuple(led_tuple_t *out)
     out->brightness = snapshot.brightness;
     out->count = snapshot.count;
     format_hex_color(snapshot.red, snapshot.green, snapshot.blue, out->color, sizeof(out->color));
-    copy_string_value(out->effect, sizeof(out->effect), effect_to_name(snapshot.effect));
-    const uint8_t effect = effect_from_index(snapshot.effect);
+    copy_string_value(out->effect, sizeof(out->effect), led_effect_to_name(snapshot.effect));
+    const uint8_t effect = led_effect_from_index(snapshot.effect);
     for (size_t index = 0; index < kEffectParamSlotCount && index < MQTT_PROTO_PARAM_COUNT; ++index) {
         out->effect_params[index] = snapshot.effect_profiles[effect].values[index];
     }
@@ -2773,10 +2576,10 @@ static esp_err_t send_state_json(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "count", snapshot.count);
     cJSON_AddNumberToObject(root, "brightness", snapshot.brightness);
     cJSON_AddStringToObject(root, "color", color_hex);
-    cJSON_AddStringToObject(root, "effect", effect_to_name(snapshot.effect));
+    cJSON_AddStringToObject(root, "effect", led_effect_to_name(snapshot.effect));
     cJSON *effect_profiles = cJSON_AddObjectToObject(root, "effect_profiles");
     for (uint8_t effect = 0; effect < LED_EFFECT_COUNT; ++effect) {
-        cJSON *profile = cJSON_AddArrayToObject(effect_profiles, effect_to_name(effect));
+        cJSON *profile = cJSON_AddArrayToObject(effect_profiles, led_effect_to_name(effect));
         for (size_t index = 0; index < kEffectParamSlotCount; ++index) {
             cJSON_AddItemToArray(profile, cJSON_CreateNumber(snapshot.effect_profiles[effect].values[index]));
         }
@@ -2786,7 +2589,7 @@ static esp_err_t send_state_json(httpd_req_t *req)
         char effect_color_hex[8];
         format_hex_color(snapshot.effect_colors[effect].red, snapshot.effect_colors[effect].green,
                          snapshot.effect_colors[effect].blue, effect_color_hex, sizeof(effect_color_hex));
-        cJSON_AddStringToObject(effect_colors, effect_to_name(effect), effect_color_hex);
+        cJSON_AddStringToObject(effect_colors, led_effect_to_name(effect), effect_color_hex);
     }
     cJSON_AddBoolToObject(root, "power", snapshot.power);
     cJSON_AddNumberToObject(root, "max_leds", APP_LED_MAX_PIXELS);
@@ -3077,7 +2880,7 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     esp_err_t err = ESP_OK;
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     s_led_state.count = static_cast<uint16_t>(count->valuedouble);
-    clamp_state(&s_led_state);
+    led_clamp_state(&s_led_state, APP_LED_MAX_PIXELS);
     copy_string_value(s_ap_ssid, sizeof(s_ap_ssid), ap_ssid->valuestring);
     if (change_password) {
         copy_string_value(s_ap_password, sizeof(s_ap_password), password_value);
@@ -4403,7 +4206,7 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
         return ESP_OK;
     }
 
-    clamp_state(&updated);
+    led_clamp_state(&updated, APP_LED_MAX_PIXELS);
     s_led_state = updated;
     err = persist_state_locked();
     xSemaphoreGive(s_state_mutex);
@@ -4571,8 +4374,8 @@ extern "C" void app_main()
     s_ota_mutex = xSemaphoreCreateMutex();
     assert(s_ota_mutex != nullptr);
 
-    reset_effect_profiles_to_defaults(&s_led_state);
-    reset_effect_colors_to_defaults(&s_led_state);
+    led_reset_effect_profiles_to_defaults(&s_led_state);
+    led_reset_effect_colors_to_defaults(&s_led_state);
     set_generated_ap_credentials();
     bool loaded_state_from_nvs = load_state_from_nvs();
     load_schedules();
@@ -4606,6 +4409,6 @@ extern "C" void app_main()
     // cost of the link on a running device can be read off the serial monitor.
     ESP_LOGI(TAG,
              "Project ready. LEDs=%u power=%u brightness=%u effect=%s color=#%02X%02X%02X free heap=%" PRIu32 " B",
-             s_led_state.count, s_led_state.power, s_led_state.brightness, effect_to_name(s_led_state.effect),
+             s_led_state.count, s_led_state.power, s_led_state.brightness, led_effect_to_name(s_led_state.effect),
              s_led_state.red, s_led_state.green, s_led_state.blue, esp_get_free_heap_size());
 }
