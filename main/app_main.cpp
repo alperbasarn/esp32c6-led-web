@@ -38,6 +38,7 @@
 #include "model/color_model.h"
 #include "model/net_model.h"
 #include "model/schedule_model.h"
+#include "model/http_encoding.h"
 #include "led_strip.h"
 #include "lwip/inet.h"
 #include "mbedtls/pk.h"
@@ -263,481 +264,14 @@ static led_indicator_mode_t s_indicator_mode = LED_INDICATOR_NONE;
 static uint8_t              s_indicator_code = 0;
 static int64_t              s_indicator_started_us = 0;
 
-static constexpr char INDEX_HTML[] = R"HTML(
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ESP32-C6 Matter LED</title>
-<style>
-:root{--bg:#08111f;--bg2:#0f1d35;--card:#101b2fcc;--line:#2f4a7d;--text:#eef4ff;--muted:#aec2e6;--accent:#6ee7ff;--accent2:#ffaf45;--good:#8ef3b0;--warn:#ffd36e;--surface:#091223;--surface2:#0b1730;--surface3:#050c17;--on-accent:#07111e;--g0:#173057;--g1:#08111f;--g2:#112748;--g3:#1d4261}
-@media (prefers-color-scheme:light){:root{--bg:#eef3fb;--bg2:#dde7f5;--card:#ffffffd9;--line:#c2d2ea;--text:#0d1a2e;--muted:#3f5474;--accent:#0b6fbf;--accent2:#b45300;--good:#157a41;--warn:#f2b705;--surface:#f4f8ff;--surface2:#eaf1fb;--surface3:#e4ecf7;--on-accent:#ffffff;--g0:#dbe6f7;--g1:#eef3fb;--g2:#e2ecfa;--g3:#d5e3f6}}
-:root[data-theme="light"]{--bg:#eef3fb;--bg2:#dde7f5;--card:#ffffffd9;--line:#c2d2ea;--text:#0d1a2e;--muted:#3f5474;--accent:#0b6fbf;--accent2:#b45300;--good:#157a41;--warn:#f2b705;--surface:#f4f8ff;--surface2:#eaf1fb;--surface3:#e4ecf7;--on-accent:#ffffff;--g0:#dbe6f7;--g1:#eef3fb;--g2:#e2ecfa;--g3:#d5e3f6}
-:root[data-theme="dark"]{--bg:#08111f;--bg2:#0f1d35;--card:#101b2fcc;--line:#2f4a7d;--text:#eef4ff;--muted:#aec2e6;--accent:#6ee7ff;--accent2:#ffaf45;--good:#8ef3b0;--warn:#ffd36e;--surface:#091223;--surface2:#0b1730;--surface3:#050c17;--on-accent:#07111e;--g0:#173057;--g1:#08111f;--g2:#112748;--g3:#1d4261}
-*{box-sizing:border-box}body{margin:0;font-family:Verdana,Segoe UI,sans-serif;color:var(--text);background:radial-gradient(circle at top left,var(--g0) 0,var(--g1) 45%),linear-gradient(135deg,var(--g1),var(--g2) 60%,var(--g3));min-height:100vh}
-.wrap{max-width:1100px;margin:0 auto;padding:24px}.hero{padding:24px 0 16px}.hero h1{margin:0;font-size:clamp(2rem,5vw,3.6rem);letter-spacing:.04em;text-transform:uppercase}.hero p{margin:12px 0 0;color:var(--muted);max-width:62rem;line-height:1.6}
-.grid{display:grid;gap:18px;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr))}.card{background:var(--card);backdrop-filter:blur(12px);border:1px solid var(--line);border-radius:22px;padding:20px;box-shadow:0 20px 50px rgba(0,0,0,.24)}
-.label{display:flex;justify-content:space-between;align-items:center;color:var(--muted);font-size:.95rem;margin-bottom:10px}.value{color:var(--text);font-weight:700}.swatch{height:128px;border-radius:18px;border:1px solid rgba(255,255,255,.15);background:#ff6020;box-shadow:inset 0 0 50px rgba(255,255,255,.18),0 0 24px rgba(255,120,80,.35);transition:all .18s ease}
-input[type=range],input[type=number],input[type=color],input[type=text],input[type=password]{width:100%}input[type=range]{accent-color:var(--accent)}input[type=number],input[type=text],input[type=password]{background:var(--surface);border:1px solid var(--line);color:var(--text);border-radius:14px;padding:12px 14px;font-size:1rem}input[type=color]{height:54px;background:transparent;border:none;padding:0}
-.row{display:grid;gap:14px;margin-top:16px}.chips{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}.chip{padding:10px 14px;border-radius:999px;background:var(--surface2);border:1px solid var(--line);color:var(--muted);font-size:.92rem}
-.actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:18px}.btn{border:none;border-radius:16px;padding:14px 18px;font-weight:700;cursor:pointer;transition:transform .14s ease,opacity .14s ease}.btn:hover{transform:translateY(-1px)}.btn:disabled{opacity:.45;cursor:not-allowed;transform:none}.btn-primary{background:linear-gradient(135deg,var(--accent),var(--accent2));color:var(--on-accent)}.btn-secondary{background:var(--surface2);color:var(--text);border:1px solid var(--line)}.btn-danger{background:#35131a;color:#ffd4da;border:1px solid #7b2a3a}
-.toggle{display:flex;align-items:center;justify-content:space-between;background:var(--surface2);border:1px solid var(--line);border-radius:16px;padding:14px 16px}.toggle input{width:22px;height:22px}
-.status{margin-top:14px;min-height:24px;color:var(--good);font-weight:700}.footer{margin-top:18px;color:var(--muted);font-size:.92rem;line-height:1.6}.pairing{margin-top:16px;padding:16px;border-radius:18px;background:var(--surface);border:1px solid var(--line)}.pairing h2{margin:0 0 8px;font-size:1rem}.pairing p{margin:8px 0;color:var(--muted);line-height:1.5}.pairing code{display:block;padding:10px 12px;background:var(--surface3);border-radius:12px;color:var(--text);overflow:auto}.link{color:var(--accent);word-break:break-all}.stack{display:grid;gap:16px}
-.tabs,.effect-tabs{display:flex;flex-wrap:wrap;gap:10px}.tab-btn{border:none;border-radius:999px;padding:12px 18px;font-weight:700;cursor:pointer;background:var(--surface2);color:var(--muted);border:1px solid var(--line)}.tab-btn.active{background:linear-gradient(135deg,var(--accent),var(--accent2));color:var(--on-accent)}.panel{display:none;margin-top:18px}.panel.active{display:block}.kv{display:grid;gap:10px}.kv-line{display:flex;justify-content:space-between;gap:12px;padding:12px 14px;border-radius:14px;background:var(--surface);border:1px solid var(--line)}.kv-line span:first-child{color:var(--muted)}.kv-line span:last-child{text-align:right;word-break:break-word}
-input[type=file]{width:100%;padding:12px 14px;background:var(--surface);border:1px dashed var(--line);color:var(--text);border-radius:14px}
-button:focus-visible,input:focus-visible,a:focus-visible{outline:3px solid var(--accent);outline-offset:3px}@media (prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
-@media (max-width:640px){.wrap{padding:18px}.card{padding:16px}.actions{flex-direction:column}.btn{width:100%}.kv-line{flex-direction:column}}
-.banner{background:var(--warn);color:#241a00;border:1px solid var(--line);border-radius:14px;padding:12px 16px;margin-bottom:16px;font-weight:700}#otaProgress{width:100%;height:16px;margin-top:10px;accent-color:var(--accent)}.link[aria-disabled="true"]{opacity:.65;cursor:default;text-decoration:none}.stale .card{opacity:.42;filter:grayscale(.35);transition:opacity .2s ease,filter .2s ease}
-select{width:100%;background:var(--surface);border:1px solid var(--line);color:var(--text);border-radius:14px;padding:12px 14px;font-size:1rem}select:disabled{opacity:.45;cursor:not-allowed}.countdown{margin-top:16px;font-size:1.25rem;font-weight:700;color:var(--accent)}
-.sched-rows{display:grid;gap:10px;margin-top:14px}.sched-row{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:10px 12px;border-radius:14px;background:var(--surface);border:1px solid var(--line)}.sched-row input[type=time]{width:auto;flex:0 0 auto;background:var(--surface2);border:1px solid var(--line);color:var(--text);border-radius:10px;padding:8px 10px;font-size:1rem}.sched-row select{width:auto;flex:0 0 auto;padding:8px 10px}.sched-row input[type=checkbox]{width:20px;height:20px;flex:0 0 auto}.sched-days{display:flex;flex-wrap:wrap;gap:6px}.sched-days label{display:flex;flex-direction:column;align-items:center;gap:2px;font-size:.68rem;color:var(--muted);cursor:pointer}.sched-days input{width:16px;height:16px}.sched-time-line{margin-top:0;color:var(--muted);font-size:.92rem;line-height:1.5}
-</style>
-</head>
-<body>
-<div class="wrap">
-<div id="connBanner" class="banner" role="alert" aria-live="assertive" hidden>Device unreachable - reconnecting...</div>
-<section class="hero">
-<h1>ESP32-C6 LED Lab</h1>
-<p>Manage Matter status, Wi-Fi setup, firmware actions, and WS2812B control from one page with clear tabs so risky actions stay separate from daily lighting control.</p>
-</section>
-<div class="tabs" role="tablist" aria-label="Primary sections">
-<button class="tab-btn active" data-main-tab="overview" role="tab" id="tab-overview" aria-controls="overviewPanel" aria-selected="true">Overview</button>
-<button class="tab-btn" data-main-tab="configuration" role="tab" id="tab-configuration" aria-controls="configurationPanel" aria-selected="false">Configuration</button>
-<button class="tab-btn" data-main-tab="control" role="tab" id="tab-control" aria-controls="controlPanel" aria-selected="false">Control</button>
-</div>
-
-<section class="panel active" id="overviewPanel" role="tabpanel" aria-labelledby="tab-overview">
-<div class="grid">
-<div class="card">
-<h2>Matter State</h2>
-<div class="kv">
-<div class="kv-line"><span>Status</span><span id="overviewMatterStatus">Loading...</span></div>
-<div class="kv-line"><span>Endpoint</span><span id="overviewMatterEndpoint">-</span></div>
-<div class="kv-line"><span>Fabric Count</span><span id="overviewMatterFabricCount">-</span></div>
-<div class="kv-line"><span>Commissioning Window</span><span id="overviewMatterWindow">-</span></div>
-<div class="kv-line"><span>Manual Code</span><span id="overviewManualCode">-</span></div>
-<div class="kv-line"><span>QR Link</span><span><a class="link" id="overviewQrLink" target="_blank" rel="noopener" aria-disabled="true">Unavailable</a></span></div>
-</div>
-<div class="footer">If the device is not yet in Apple Home, use the manual code or QR link while the commissioning window is open.</div>
-<div class="actions">
-<button class="btn btn-primary" id="openMatterWindowBtn" disabled>Open 5-Minute Pairing Window</button>
-</div>
-<div class="status" id="matterPairingStatus" role="status" aria-live="polite"></div>
-<div class="footer">This action is available from the device SoftAP only. A commissioned device must use an existing Matter administrator to add another controller.</div>
-</div>
-<div class="card">
-<h2>Wi-Fi State</h2>
-<div class="kv">
-<div class="kv-line"><span>Active AP SSID</span><span id="overviewApSsid">-</span></div>
-<div class="kv-line"><span>AP Web UI</span><span><a class="link" id="overviewApUrl" target="_blank" rel="noopener" aria-disabled="true">Unavailable</a></span></div>
-<div class="kv-line"><span>Station Status</span><span id="overviewStaStatus">-</span></div>
-<div class="kv-line"><span>Station SSID</span><span id="overviewStaSsid">-</span></div>
-<div class="kv-line"><span>BSSID / Channel</span><span id="overviewStaBssid">-</span></div>
-<div class="kv-line"><span>Signal (RSSI)</span><span id="overviewStaRssi">-</span></div>
-<div class="kv-line"><span>Last Disconnect Reason</span><span id="overviewStaReason">-</span></div>
-<div class="kv-line"><span>LAN Web UI</span><span><a class="link" id="overviewLanUrl" target="_blank" rel="noopener" aria-disabled="true">Unavailable</a></span></div>
-<div class="kv-line"><span>Restart Needed</span><span id="overviewApRestart">-</span></div>
-</div>
-</div>
-<div class="card">
-<h2>Firmware Version</h2>
-<div class="kv">
-<div class="kv-line"><span>Current Version</span><span id="overviewFwVersion">-</span></div>
-<div class="kv-line"><span>Running Slot</span><span id="overviewRunningPartition">-</span></div>
-<div class="kv-line"><span>Next OTA Slot</span><span id="overviewNextPartition">-</span></div>
-<div class="kv-line"><span>Revert Target</span><span id="overviewRevertTarget">-</span></div>
-<div class="kv-line"><span>Available Version</span><span id="overviewPublishedVersion">-</span></div>
-<div class="kv-line"><span>Update Status</span><span id="overviewUpdateStatus">-</span></div>
-</div>
-</div>
-</div>
-</section>
-
-<section class="panel" id="configurationPanel" role="tabpanel" aria-labelledby="tab-configuration">
-<div class="grid">
-<div class="card">
-<h2>Device Configuration</h2>
-<div class="row">
-<div>
-<div class="label"><span>LED Count</span><span class="value" id="configCountValue">0</span></div>
-<input id="configCount" type="range" min="1" max="120" step="1" value="8" aria-label="LED Count">
-</div>
-<div>
-<div class="label"><span>Exact Count</span><span class="value">Numeric input</span></div>
-<input id="configCountNumber" type="number" min="1" max="120" value="8" aria-label="Exact LED count">
-</div>
-<div>
-<div class="label"><span>AP SSID</span><span class="value">1-32 chars</span></div>
-<input id="configApSsid" type="text" maxlength="32" value="" aria-label="AP SSID">
-</div>
-<div>
-<div class="label"><span>AP Password</span><span class="value">8-63 chars, blank keeps current</span></div>
-<input id="configApPassword" type="password" maxlength="63" placeholder="Leave blank to keep the current password" value="" aria-label="AP Password (leave blank to keep current)">
-</div>
-<label class="toggle"><span>Install published updates automatically</span><input id="configAutoInstall" type="checkbox" checked></label>
-</div>
-<div class="actions">
-<button class="btn btn-primary" id="saveConfigBtn">Save Configuration</button>
-<button class="btn btn-secondary" id="rebootBtn">Reboot</button>
-</div>
-<div class="status" id="configStatus" role="status" aria-live="polite"></div>
-<div class="footer">New AP credentials are saved immediately but become active after a reset. Firmware and configuration administration is available from the device SoftAP; the LAN view remains useful for status and LED control. With auto-install on, the device installs newer published releases on its own; off, it only checks and surfaces them for you to press Install Update.</div>
-</div>
-<div class="card">
-<h2>MQTT Link</h2>
-<div class="kv">
-<div class="kv-line"><span>Link Status</span><span id="mqttStatusValue">-</span></div>
-<div class="kv-line"><span>Device Id</span><span id="mqttDeviceId">-</span></div>
-<div class="kv-line"><span>Last Error</span><span id="mqttError">None</span></div>
-<div class="kv-line"><span>Pairing Window</span><span id="mqttPairing">Closed</span></div>
-</div>
-<div class="row">
-<div>
-<div class="label"><span>Broker Host</span><span class="value">blank disables the link</span></div>
-<input id="mqttHost" type="text" maxlength="63" placeholder="broker.example.com" value="" aria-label="MQTT broker host">
-</div>
-<div>
-<div class="label"><span>Port</span><span class="value">1-65535</span></div>
-<input id="mqttPort" type="number" min="1" max="65535" value="8883" aria-label="MQTT broker port">
-</div>
-<div>
-<div class="label"><span>Username</span><span class="value">optional</span></div>
-<input id="mqttUser" type="text" maxlength="47" value="" aria-label="MQTT username">
-</div>
-<div>
-<div class="label"><span>Password</span><span class="value">blank keeps current</span></div>
-<input id="mqttPass" type="password" maxlength="71" placeholder="Leave blank to keep the current password" value="" aria-label="MQTT password (leave blank to keep current)">
-</div>
-<label class="toggle"><span>Use TLS (mqtts)</span><input id="mqttTls" type="checkbox" checked></label>
-</div>
-<div class="actions">
-<button class="btn btn-primary" id="saveMqttBtn">Save MQTT Settings</button>
-</div>
-<div class="status" id="mqttStatus" role="status" aria-live="polite"></div>
-<h2 style="margin-top:18px;font-size:1rem">Paired Controllers</h2>
-<div class="kv" id="mqttControllers"></div>
-<div class="footer">Broker settings are accepted from the device SoftAP only and the password is never shown again. A controller pairs from its own screen: the strip blinks a code, you confirm it there. Factory reset clears both the broker settings and this list.</div>
-</div>
-<div class="card">
-<h2>Firmware Actions</h2>
-<div class="pairing">
-<h2>Firmware Update</h2>
-<p>Published updates are checked periodically. When automatic installation is off, press <strong>Install Update</strong> to apply an available release; when it is on, newer releases are installed after a successful check.</p>
-<div class="kv" style="margin-bottom:12px">
-<div class="kv-line"><span>Current</span><span id="firmwareCurrentVersion">-</span></div>
-<div class="kv-line"><span>Available</span><span id="firmwareAvailableVersion">-</span></div>
-</div>
-<div class="actions">
-<button class="btn btn-primary" id="installUpdateBtn" disabled>Install Update</button>
-<button class="btn btn-secondary" id="checkUpdateBtn">Check For Updates</button>
-</div>
-<p class="footer" id="updateStatusLine" role="status" aria-live="polite">Press <em>Check For Updates</em> to query GitHub now.</p>
-<hr style="border:none;border-top:1px solid var(--line);margin:14px 0">
-<p>Or upload a build of this project to install from your own binary.</p>
-<input id="otaFile" type="file" accept=".bin,application/octet-stream" aria-label="Firmware .bin file">
-<div class="actions">
-<button class="btn btn-secondary" id="otaBtn">Install From File</button>
-</div>
-<p class="footer" id="otaStatus" role="status" aria-live="polite">Use <code>build/esp32c6_led_web.bin</code> after the first USB flash.</p>
-<progress id="otaProgress" max="100" value="0" hidden></progress>
-</div>
-<div class="actions">
-<button class="btn btn-secondary" id="revertBtn">Revert To Previous Firmware</button>
-<button class="btn btn-danger" id="factoryResetBtn">Factory Reset</button>
-</div>
-<div class="status" id="actionStatus" role="status" aria-live="polite"></div>
-</div>
-<div class="card">
-<h2>Schedules</h2>
-<div class="footer sched-time-line" id="scheduleTimeLine">Device time: loading...</div>
-<div class="row">
-<div>
-<div class="label"><span>Timezone (POSIX TZ)</span><span class="value">up to 39 chars</span></div>
-<input id="scheduleTz" type="text" maxlength="39" placeholder="e.g. CET-1CEST,M3.5.0,M10.5.0/3" aria-label="POSIX timezone">
-</div>
-</div>
-<div class="sched-rows" id="scheduleRows"></div>
-<div class="actions">
-<button class="btn btn-primary" id="saveScheduleBtn">Save Schedules</button>
-</div>
-<div class="status" id="scheduleStatus" role="status" aria-live="polite"></div>
-<div class="footer">Fixed schedules toggle power only (keeping color, brightness, and effect) and require internet time via SNTP. Disabled rows are still saved. Editing schedules is available from the device SoftAP.</div>
-</div>
-</div>
-</section>
-
-<section class="panel" id="controlPanel" role="tabpanel" aria-labelledby="tab-control">
-<div class="card">
-<div class="row">
-<div>
-<div class="label"><span>Brightness</span><span class="value" id="brightnessValue">0</span></div>
-<input id="controlBrightness" type="range" min="0" max="255" step="1" value="96" aria-label="Brightness">
-</div>
-<div>
-<div class="label"><span>Color</span><span class="value" id="controlColorValue">#FF6020</span></div>
-<input id="controlColor" type="color" value="#ff6020" aria-label="Color">
-</div>
-</div>
-<div class="row">
-<div class="swatch" id="livePreview" role="img" aria-label="Live color and brightness preview"></div>
-</div>
-<div class="row">
-<div id="effectColorRow" style="display:none">
-<div class="label"><span id="effectColorLabel">Effect Color</span><span class="value" id="effectColorValue">#FFFFFF</span></div>
-<input id="effectColor" type="color" value="#ffffff" aria-label="Effect color">
-</div>
-</div>
-<div class="effect-tabs" role="tablist" aria-label="LED effect">
-<button class="tab-btn active" data-effect-tab="solid" role="tab" aria-controls="effectParamPanel" aria-selected="true">Solid</button>
-<button class="tab-btn" data-effect-tab="glow" role="tab" aria-controls="effectParamPanel" aria-selected="false">Glow</button>
-<button class="tab-btn" data-effect-tab="rainbow" role="tab" aria-controls="effectParamPanel" aria-selected="false">Rainbow</button>
-<button class="tab-btn" data-effect-tab="chase" role="tab" aria-controls="effectParamPanel" aria-selected="false">Chase</button>
-<button class="tab-btn" data-effect-tab="sparkle" role="tab" aria-controls="effectParamPanel" aria-selected="false">Sparkle</button>
-<button class="tab-btn" data-effect-tab="wave" role="tab" aria-controls="effectParamPanel" aria-selected="false">Wave</button>
-<button class="tab-btn" data-effect-tab="fire" role="tab" aria-controls="effectParamPanel" aria-selected="false">Fire</button>
-<button class="tab-btn" data-effect-tab="aurora" role="tab" aria-controls="effectParamPanel" aria-selected="false">Aurora</button>
-</div>
-<div class="row" id="effectParamPanel" role="tabpanel" aria-label="Effect parameters">
-<div id="effectParamRow0">
-<div class="label"><span id="effectParamLabel0">Param 1</span><span class="value" id="effectParamValue0">0</span></div>
-<input id="effectParamInput0" type="range" min="0" max="255" step="1" value="0">
-</div>
-<div id="effectParamRow1">
-<div class="label"><span id="effectParamLabel1">Param 2</span><span class="value" id="effectParamValue1">0</span></div>
-<input id="effectParamInput1" type="range" min="0" max="255" step="1" value="0">
-</div>
-<div id="effectParamRow2">
-<div class="label"><span id="effectParamLabel2">Param 3</span><span class="value" id="effectParamValue2">0</span></div>
-<input id="effectParamInput2" type="range" min="0" max="255" step="1" value="0">
-</div>
-<div id="effectParamRow3">
-<div class="label"><span id="effectParamLabel3">Param 4</span><span class="value" id="effectParamValue3">0</span></div>
-<input id="effectParamInput3" type="range" min="0" max="255" step="1" value="0">
-</div>
-<div id="effectParamRow4">
-<div class="label"><span id="effectParamLabel4">Param 5</span><span class="value" id="effectParamValue4">0</span></div>
-<input id="effectParamInput4" type="range" min="0" max="255" step="1" value="0">
-</div>
-</div>
-<div class="actions">
-<button class="btn btn-primary" id="saveControlBtn">Apply Control</button>
-<button class="btn btn-secondary" id="reloadBtn">Reload Device State</button>
-</div>
-<div class="status" id="controlStatus" role="status" aria-live="polite"></div>
-<div class="footer">Applying control turns the strip on when brightness is above zero. Set brightness to zero to keep it dark.</div>
-</div>
-<div class="card">
-<h2>Sleep / Wake Timer</h2>
-<div class="row">
-<div>
-<div class="label"><span>Action</span><span class="value">One-shot</span></div>
-<select id="timerAction" aria-label="Timer action"><option value="0">Turn Off</option><option value="1">Turn On</option></select>
-</div>
-<div>
-<div class="label"><span>Minutes</span><span class="value">1-1440</span></div>
-<input id="timerMinutes" type="number" min="1" max="1440" value="30" aria-label="Timer minutes">
-</div>
-</div>
-<div class="actions">
-<button class="btn btn-primary" id="timerStartBtn">Start Timer</button>
-<button class="btn btn-secondary" id="timerCancelBtn">Cancel Timer</button>
-</div>
-<div class="countdown" id="timerCountdown" role="status" aria-live="polite">No timer set</div>
-<div class="status" id="timerStatus" role="status" aria-live="polite"></div>
-<div class="footer">A one-shot timer that toggles power only, keeping the saved color, brightness, and effect. It counts from device uptime and is cleared by a reboot. Works without internet time.</div>
-</div>
-</section>
-</div>
-<script>
-const mainTabButtons = Array.from(document.querySelectorAll('[data-main-tab]'));
-const panels = {overview:document.getElementById('overviewPanel'),configuration:document.getElementById('configurationPanel'),control:document.getElementById('controlPanel')};
-const configCount = document.getElementById('configCount');
-const configCountNumber = document.getElementById('configCountNumber');
-const configCountValue = document.getElementById('configCountValue');
-const configApSsid = document.getElementById('configApSsid');
-const configApPassword = document.getElementById('configApPassword');
-const configAutoInstall = document.getElementById('configAutoInstall');
-const mqttStatusValue = document.getElementById('mqttStatusValue');
-const mqttDeviceId = document.getElementById('mqttDeviceId');
-const mqttError = document.getElementById('mqttError');
-const mqttPairing = document.getElementById('mqttPairing');
-const mqttHost = document.getElementById('mqttHost');
-const mqttPort = document.getElementById('mqttPort');
-const mqttUser = document.getElementById('mqttUser');
-const mqttPass = document.getElementById('mqttPass');
-const mqttTls = document.getElementById('mqttTls');
-const saveMqttBtn = document.getElementById('saveMqttBtn');
-const mqttStatus = document.getElementById('mqttStatus');
-const mqttControllers = document.getElementById('mqttControllers');
-const controlBrightness = document.getElementById('controlBrightness');
-const controlColor = document.getElementById('controlColor');
-const controlColorValue = document.getElementById('controlColorValue');
-const effectColorRow = document.getElementById('effectColorRow');
-const effectColor = document.getElementById('effectColor');
-const effectColorLabel = document.getElementById('effectColorLabel');
-const effectColorValue = document.getElementById('effectColorValue');
-const controlStatus = document.getElementById('controlStatus');
-const configStatus = document.getElementById('configStatus');
-const actionStatus = document.getElementById('actionStatus');
-const brightnessValue = document.getElementById('brightnessValue');
-const otaFile = document.getElementById('otaFile');
-const otaBtn = document.getElementById('otaBtn');
-const otaStatus = document.getElementById('otaStatus');
-const otaProgress = document.getElementById('otaProgress');
-const connBanner = document.getElementById('connBanner');
-const pageWrap = document.querySelector('.wrap');
-const overviewMatterStatus = document.getElementById('overviewMatterStatus');
-const overviewMatterEndpoint = document.getElementById('overviewMatterEndpoint');
-const overviewMatterFabricCount = document.getElementById('overviewMatterFabricCount');
-const overviewMatterWindow = document.getElementById('overviewMatterWindow');
-const openMatterWindowBtn = document.getElementById('openMatterWindowBtn');
-const matterPairingStatus = document.getElementById('matterPairingStatus');
-const overviewManualCode = document.getElementById('overviewManualCode');
-const overviewQrLink = document.getElementById('overviewQrLink');
-const overviewApSsid = document.getElementById('overviewApSsid');
-const overviewApUrl = document.getElementById('overviewApUrl');
-const overviewStaStatus = document.getElementById('overviewStaStatus');
-const overviewStaSsid = document.getElementById('overviewStaSsid');
-const overviewStaBssid = document.getElementById('overviewStaBssid');
-const overviewStaRssi = document.getElementById('overviewStaRssi');
-const overviewStaReason = document.getElementById('overviewStaReason');
-const overviewLanUrl = document.getElementById('overviewLanUrl');
-const overviewApRestart = document.getElementById('overviewApRestart');
-const overviewFwVersion = document.getElementById('overviewFwVersion');
-const overviewRunningPartition = document.getElementById('overviewRunningPartition');
-const overviewNextPartition = document.getElementById('overviewNextPartition');
-const overviewRevertTarget = document.getElementById('overviewRevertTarget');
-const overviewPublishedVersion = document.getElementById('overviewPublishedVersion');
-const overviewUpdateStatus = document.getElementById('overviewUpdateStatus');
-const firmwareCurrentVersion = document.getElementById('firmwareCurrentVersion');
-const firmwareAvailableVersion = document.getElementById('firmwareAvailableVersion');
-const updateStatusLine = document.getElementById('updateStatusLine');
-const installUpdateBtn = document.getElementById('installUpdateBtn');
-const saveConfigBtn = document.getElementById('saveConfigBtn');
-const saveControlBtn = document.getElementById('saveControlBtn');
-const rebootBtn = document.getElementById('rebootBtn');
-const revertBtn = document.getElementById('revertBtn');
-const factoryResetBtn = document.getElementById('factoryResetBtn');
-const checkUpdateBtn = document.getElementById('checkUpdateBtn');
-const timerAction = document.getElementById('timerAction');
-const timerMinutes = document.getElementById('timerMinutes');
-const timerStartBtn = document.getElementById('timerStartBtn');
-const timerCancelBtn = document.getElementById('timerCancelBtn');
-const timerCountdown = document.getElementById('timerCountdown');
-const timerStatus = document.getElementById('timerStatus');
-const scheduleTz = document.getElementById('scheduleTz');
-const scheduleRows = document.getElementById('scheduleRows');
-const scheduleTimeLine = document.getElementById('scheduleTimeLine');
-const saveScheduleBtn = document.getElementById('saveScheduleBtn');
-const scheduleStatus = document.getElementById('scheduleStatus');
-const SCHED_COUNT = 8;
-const DAY_LABELS = ['Su','Mo','Tu','We','Th','Fr','Sa'];
-let scheduleRowEls = [];
-const effectTabButtons = Array.from(document.querySelectorAll('[data-effect-tab]'));
-const effectParamRows = [0,1,2,3,4].map((index)=>({row:document.getElementById('effectParamRow'+index),label:document.getElementById('effectParamLabel'+index),value:document.getElementById('effectParamValue'+index),input:document.getElementById('effectParamInput'+index)}));
-const EFFECT_META = {
-solid:{params:[],colors:[]},
-glow:{params:[{label:'Pulse Speed',min:1,max:255,defaultValue:140},{label:'Glow Floor',min:0,max:255,defaultValue:72},{label:'Pulse Depth',min:0,max:255,defaultValue:180}],colors:[]},
-rainbow:{params:[{label:'Drift Speed',min:1,max:255,defaultValue:120},{label:'Rainbow Length',min:1,max:255,defaultValue:96},{label:'Color Blend',min:0,max:255,defaultValue:220},{label:'Start Offset',min:0,max:255,defaultValue:0},{label:'Contrast',min:0,max:255,defaultValue:96}],colors:[]},
-chase:{params:[{label:'Chase Speed',min:1,max:255,defaultValue:175},{label:'Tail Length',min:1,max:255,defaultValue:90},{label:'Tail Sharpness',min:0,max:255,defaultValue:170}],colors:[]},
-sparkle:{params:[{label:'Spark Density',min:1,max:255,defaultValue:180},{label:'Base Glow',min:0,max:255,defaultValue:60},{label:'Twinkle Speed',min:1,max:255,defaultValue:170}],colors:[{label:'Sparkle Color',defaultValue:'#FFFFFF'}]},
-wave:{params:[{label:'Wave Speed',min:1,max:255,defaultValue:110},{label:'Wavelength',min:1,max:255,defaultValue:110},{label:'Wave Depth',min:0,max:255,defaultValue:190}],colors:[]},
-fire:{params:[{label:'Cooling',min:0,max:255,defaultValue:90},{label:'Sparking',min:0,max:255,defaultValue:120},{label:'Flame Speed',min:1,max:255,defaultValue:150},{label:'Flame Height',min:1,max:255,defaultValue:120},{label:'Warmth',min:0,max:255,defaultValue:160}],colors:[]},
-aurora:{params:[{label:'Drift Speed',min:1,max:255,defaultValue:70},{label:'Color Scale',min:1,max:255,defaultValue:110},{label:'Saturation',min:0,max:255,defaultValue:210},{label:'Hue Center',min:0,max:255,defaultValue:150},{label:'Hue Spread',min:0,max:255,defaultValue:90}],colors:[]}
-};
-let effectProfiles = {};
-let effectColors = {};
-let selectedEffect = 'solid';
-const livePreview = document.getElementById('livePreview');
-let otaInFlight = false;let liveApplyPending = false;let liveApplyTimer = null;
-function switchMainTab(name){mainTabButtons.forEach((button)=>{const on=button.dataset.mainTab===name;button.classList.toggle('active',on);button.setAttribute('aria-selected',on?'true':'false')});Object.entries(panels).forEach(([panelName,panel])=>panel.classList.toggle('active',panelName===name))}
-function buildDefaultEffectProfiles(){const profiles={};for(const [name,meta] of Object.entries(EFFECT_META)){profiles[name]=[0,0,0,0,0];meta.params.forEach((param,index)=>{profiles[name][index]=param.defaultValue})}return profiles}
-function buildDefaultEffectColors(){const colors={};for(const [name,meta] of Object.entries(EFFECT_META)){colors[name]=(meta.colors&&meta.colors[0]?meta.colors[0].defaultValue:'#FFFFFF').toUpperCase()}return colors}
-function normalizeEffectProfiles(rawProfiles){const profiles=buildDefaultEffectProfiles();for(const [name,values] of Object.entries(rawProfiles||{})){if(!profiles[name]||!Array.isArray(values))continue;values.forEach((value,index)=>{const meta=EFFECT_META[name].params[index];if(!meta)return;const parsed=Number(value);if(Number.isFinite(parsed)){profiles[name][index]=Math.max(meta.min,Math.min(meta.max,parsed))}})}return profiles}
-function normalizeHexColor(value,fallback){return typeof value==='string'&&/^#[0-9a-fA-F]{6}$/.test(value)?value.toUpperCase():fallback}
-function normalizeEffectColors(rawColors){const colors=buildDefaultEffectColors();for(const [name,value] of Object.entries(rawColors||{})){if(!(name in colors))continue;colors[name]=normalizeHexColor(value,colors[name])}return colors}
-function syncConfigCount(v){configCount.value=v;configCountNumber.value=v;configCountValue.textContent=v}
-function getSelectedEffectValues(){if(!effectProfiles[selectedEffect]){effectProfiles[selectedEffect]=buildDefaultEffectProfiles()[selectedEffect]||[0,0,0,0,0]}return effectProfiles[selectedEffect]}
-function getSelectedEffectColor(){if(!(selectedEffect in effectColors)){effectColors[selectedEffect]=buildDefaultEffectColors()[selectedEffect]||'#FFFFFF'}return effectColors[selectedEffect]}
-function renderEffectButtons(){effectTabButtons.forEach((button)=>{const on=button.dataset.effectTab===selectedEffect;button.classList.toggle('active',on);button.setAttribute('aria-selected',on?'true':'false')})}
-function syncEffectControls(){const meta=EFFECT_META[selectedEffect]||EFFECT_META.solid;const values=getSelectedEffectValues();effectParamRows.forEach((slot,index)=>{const spec=meta.params[index];if(!spec){slot.row.style.display='none';return}slot.row.style.display='block';slot.label.textContent=spec.label;slot.input.setAttribute('aria-label',spec.label);slot.input.min=spec.min;slot.input.max=spec.max;slot.input.value=values[index];slot.value.textContent=values[index]});const colorSpec=(meta.colors||[])[0];if(!colorSpec){effectColorRow.style.display='none'}else{effectColorRow.style.display='block';effectColorLabel.textContent=colorSpec.label;effectColor.setAttribute('aria-label',colorSpec.label);effectColor.value=getSelectedEffectColor().toLowerCase();effectColorValue.textContent=getSelectedEffectColor().toUpperCase()}renderEffectButtons()}
-function stashEffectControls(){const meta=EFFECT_META[selectedEffect]||EFFECT_META.solid;const values=getSelectedEffectValues();effectParamRows.forEach((slot,index)=>{if(!meta.params[index]){values[index]=0;return}values[index]=Number(slot.input.value);slot.value.textContent=slot.input.value});if((meta.colors||[])[0]){effectColors[selectedEffect]=normalizeHexColor(effectColor.value,getSelectedEffectColor())}}
-function updateLivePreview(){const scale=Number(controlBrightness.value)/255;livePreview.style.background=controlColor.value;livePreview.style.filter='brightness('+Math.max(0.12,scale).toFixed(3)+')'}
-function updateControlReadout(){brightnessValue.textContent=controlBrightness.value;controlColorValue.textContent=controlColor.value.toUpperCase();if(effectColorRow.style.display!=='none'){effectColorValue.textContent=effectColor.value.toUpperCase()}updateLivePreview()}
-function buildControlPayload(){const brightness=Number(controlBrightness.value);const payload={brightness:brightness,color:controlColor.value,effect:selectedEffect,effect_params:getSelectedEffectValues(),power:brightness>0};if((EFFECT_META[selectedEffect].colors||[])[0]){payload.effect_color=getSelectedEffectColor()}return payload}
-function scheduleLiveApply(){if(otaInFlight)return;liveApplyPending=true;if(liveApplyTimer)clearTimeout(liveApplyTimer);liveApplyTimer=setTimeout(liveApply,150)}
-async function liveApply(){liveApplyTimer=null;if(otaInFlight){liveApplyPending=false;return}stashEffectControls();const payload=buildControlPayload();try{const res=await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(res.ok){await res.json().catch(()=>{})}}catch(_){}finally{if(!liveApplyTimer)liveApplyPending=false;updateControlReadout()}}
-function reconcileControls(data){if(liveApplyPending||otaInFlight)return;const active=document.activeElement;const busy=[controlBrightness,controlColor,effectColor].concat(effectParamRows.map((slot)=>slot.input)).concat(effectTabButtons);if(busy.indexOf(active)!==-1)return;effectProfiles=normalizeEffectProfiles(data.effect_profiles);effectColors=normalizeEffectColors(data.effect_colors);selectedEffect=data.effect||selectedEffect;controlBrightness.value=data.brightness;controlColor.value=data.color||controlColor.value;syncEffectControls();updateControlReadout()}
-function setLink(linkEl,url,emptyLabel){if(url){linkEl.setAttribute('href',url);linkEl.removeAttribute('aria-disabled');linkEl.textContent=url}else{linkEl.removeAttribute('href');linkEl.setAttribute('aria-disabled','true');linkEl.textContent=emptyLabel||'Unavailable'}}
-function stampUserMsg(el,msg){el.dataset.userTs=String(Date.now());el.textContent=msg}
-function userMsgRecent(el){const t=Number(el.dataset.userTs||0);return t>0&&(Date.now()-t)<8000}
-let timerActive=false;let timerActionVal=0;let timerRemaining=0;let timerTick=null;
-function pad2(n){return String(n).padStart(2,'0')}
-function fmtDuration(s){s=Math.max(0,Math.floor(s));const h=Math.floor(s/3600);const m=Math.floor((s%3600)/60);const sec=s%60;return h>0?(h+':'+pad2(m)+':'+pad2(sec)):(m+':'+pad2(sec))}
-function renderCountdown(){if(!timerActive){timerCountdown.textContent='No timer set';return}timerCountdown.textContent=(timerActionVal===1?'Turns on in ':'Turns off in ')+fmtDuration(timerRemaining)}
-function syncTimer(active,action,remaining){timerActive=!!active;timerActionVal=Number(action)||0;timerRemaining=Math.max(0,Number(remaining)||0);renderCountdown()}
-function timerLocalTick(){if(!timerActive)return;if(timerRemaining>0){timerRemaining--;if(timerRemaining<=0){timerActive=false}renderCountdown()}}
-async function startTimer(){const mins=Math.max(1,Math.min(1440,Math.floor(Number(timerMinutes.value)||0)));const action=Number(timerAction.value)===1?1:0;timerStatus.textContent='Starting timer...';const res=await fetch('/api/timer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action,minutes:mins})});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok)throw new Error(data.message||text||'Failed to start timer');timerStatus.textContent=data.message||'Timer started';syncTimer(true,action,mins*60);pollStatus()}
-async function cancelTimer(){timerStatus.textContent='Cancelling timer...';const res=await fetch('/api/timer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:0,minutes:0})});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok)throw new Error(data.message||text||'Failed to cancel timer');timerStatus.textContent=data.message||'Timer cancelled';syncTimer(false,0,0);pollStatus()}
-function buildScheduleRows(){scheduleRowEls=[];scheduleRows.innerHTML='';for(let i=0;i<SCHED_COUNT;i++){const row=document.createElement('div');row.className='sched-row';const en=document.createElement('input');en.type='checkbox';en.setAttribute('aria-label','Schedule '+(i+1)+' enabled');const time=document.createElement('input');time.type='time';time.value='00:00';time.setAttribute('aria-label','Schedule '+(i+1)+' time');const days=document.createElement('div');days.className='sched-days';const dayInputs=[];for(let d=0;d<7;d++){const lab=document.createElement('label');const cb=document.createElement('input');cb.type='checkbox';cb.setAttribute('aria-label','Schedule '+(i+1)+' '+DAY_LABELS[d]);const span=document.createElement('span');span.textContent=DAY_LABELS[d];lab.appendChild(cb);lab.appendChild(span);days.appendChild(lab);dayInputs.push(cb)}const act=document.createElement('select');act.setAttribute('aria-label','Schedule '+(i+1)+' action');const optOn=document.createElement('option');optOn.value='1';optOn.textContent='On';const optOff=document.createElement('option');optOff.value='0';optOff.textContent='Off';act.appendChild(optOn);act.appendChild(optOff);row.appendChild(en);row.appendChild(time);row.appendChild(days);row.appendChild(act);scheduleRows.appendChild(row);scheduleRowEls.push({enabled:en,time:time,days:dayInputs,action:act})}}
-function fillScheduleRow(slot,entry){slot.enabled.checked=Number(entry.enabled)?true:false;const h=Math.max(0,Math.min(23,Number(entry.hour)||0));const m=Math.max(0,Math.min(59,Number(entry.minute)||0));slot.time.value=pad2(h)+':'+pad2(m);const mask=Number(entry.days)||0;slot.days.forEach((cb,d)=>{cb.checked=(mask&(1<<d))!==0});slot.action.value=Number(entry.action)===1?'1':'0'}
-function readScheduleRow(slot){const parts=(slot.time.value||'00:00').split(':');const h=Math.max(0,Math.min(23,parseInt(parts[0],10)||0));const m=Math.max(0,Math.min(59,parseInt(parts[1],10)||0));let mask=0;slot.days.forEach((cb,d)=>{if(cb.checked)mask|=(1<<d)});return{enabled:slot.enabled.checked?1:0,hour:h,minute:m,days:mask,action:Number(slot.action.value)===1?1:0}}
-function updateScheduleTimeLine(timeValid,nowLocal){if(timeValid){scheduleTimeLine.textContent='Device time: '+(nowLocal||'-')}else{scheduleTimeLine.textContent='Clock not synced yet (schedules need internet).'}}
-function applyScheduleConfig(data){if(!scheduleRowEls.length)buildScheduleRows();if(typeof data.tz==='string')scheduleTz.value=data.tz;const list=Array.isArray(data.schedules)?data.schedules:[];for(let i=0;i<SCHED_COUNT;i++){fillScheduleRow(scheduleRowEls[i],list[i]||{})}updateScheduleTimeLine(!!data.time_valid,data.now_local);if(data.relative)syncTimer(data.relative.active,data.relative.action,data.relative.remaining_s)}
-async function loadSchedule(){const res=await fetch('/api/schedule',{cache:'no-store'});if(!res.ok)throw new Error('Failed to load schedules');const data=await res.json();applyScheduleConfig(data);return data}
-async function saveSchedule(){scheduleStatus.textContent='Saving schedules...';const schedules=scheduleRowEls.map(readScheduleRow);const payload={tz:scheduleTz.value.trim(),schedules:schedules};const res=await fetch('/api/schedule',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const text=await res.text();if(!res.ok)throw new Error(text||'Failed to save schedules');let data={};try{data=JSON.parse(text)}catch(_){ }applyScheduleConfig(data);scheduleStatus.textContent='Schedules saved'}
-function refreshOverview(data){const admin=data.softap_admin!==false;const windowOpen=!!data.matter_window_open;overviewMatterStatus.textContent=data.commissioned?'Commissioned':'Ready to pair';overviewMatterEndpoint.textContent=data.matter_endpoint;overviewMatterFabricCount.textContent=(data.matter_fabric_count??'-');overviewMatterWindow.textContent=windowOpen?'Open':'Closed';openMatterWindowBtn.disabled=!admin||!data.matter_ready||!!data.commissioned||windowOpen;openMatterWindowBtn.textContent=windowOpen?'Pairing Window Open':(data.commissioned?'Pairing Managed by Matter':'Open 5-Minute Pairing Window');if(!userMsgRecent(matterPairingStatus)){matterPairingStatus.textContent=!admin?'Connect to the device SoftAP to open pairing.':!data.matter_ready?'Matter stack is not ready.':windowOpen?'Open for 5 minutes.':data.commissioned?'Closed; use an existing Matter administrator to add a controller.':'Closed; press the button to open it.'}overviewManualCode.textContent=data.manual_code||'Unavailable';setLink(overviewQrLink,data.qr_url,'Unavailable');overviewApSsid.textContent=data.ap_ssid||'-';setLink(overviewApUrl,data.ap_url||(data.ap_ip?('http://'+data.ap_ip):''),'Unavailable');overviewStaStatus.textContent=data.sta_connected?'Connected':'Not connected';overviewStaSsid.textContent=data.sta_ssid||'-';overviewStaBssid.textContent=(data.sta_bssid||'-')+(data.sta_channel?(' / ch '+data.sta_channel):'');overviewStaRssi.textContent=(data.sta_rssi||data.sta_rssi===0)?(data.sta_rssi+' dBm'):'-';overviewStaReason.textContent=(data.sta_last_disconnect_reason&&data.sta_last_disconnect_reason!==0)?((data.sta_last_disconnect_reason_text||'unknown')+' ('+String(data.sta_last_disconnect_reason)+')'):'None';setLink(overviewLanUrl,data.lan_url||(data.sta_ip?('http://'+data.sta_ip):''),'Not connected');overviewApRestart.textContent=data.ap_restart_required?'Yes, reboot to apply new AP config':'No';overviewFwVersion.textContent=data.fw_version||'unknown';overviewRunningPartition.textContent=data.running_partition||'-';overviewNextPartition.textContent=data.ota_target_partition||'-';overviewRevertTarget.textContent=data.revert_available?((data.revert_version||'unknown')+' @ '+(data.revert_partition||'')):'No previous firmware available';overviewPublishedVersion.textContent=data.auto_update_latest_version||'Unknown';overviewUpdateStatus.textContent=data.auto_update_status||'Idle'}
-function refreshFirmwarePanel(data){const cur=data.fw_version||'unknown';const avail=data.auto_update_latest_version||'';const admin=data.softap_admin!==false;firmwareCurrentVersion.textContent=cur;firmwareAvailableVersion.textContent=avail?avail:'No update available';const canInstall=!!data.auto_update_available && !data.auto_update_busy && avail && avail!==cur;installUpdateBtn.disabled=!admin||!canInstall;installUpdateBtn.textContent=data.auto_update_busy?'Installing...':(canInstall?('Install Update '+avail):'Install Update');if(!userMsgRecent(updateStatusLine)){updateStatusLine.textContent=data.auto_update_status||'Idle'}}
-function renderMqttControllers(list,admin){mqttControllers.textContent='';const items=Array.isArray(list)?list:[];if(!items.length){const empty=document.createElement('div');empty.className='kv-line';const label=document.createElement('span');label.textContent='No controllers paired';empty.appendChild(label);mqttControllers.appendChild(empty);return}items.forEach((entry)=>{const row=document.createElement('div');row.className='kv-line';const label=document.createElement('span');label.textContent=(entry&&entry.name)?entry.name:'(unnamed)';const right=document.createElement('span');const id=document.createElement('span');id.textContent=(entry&&entry.id)?entry.id:'';const btn=document.createElement('button');btn.className='btn btn-secondary';btn.style.marginLeft='10px';btn.style.padding='6px 12px';btn.textContent='Unpair';btn.disabled=!admin;btn.addEventListener('click',()=>unpairController(entry&&entry.id).catch(err=>mqttStatus.textContent=err.message));right.appendChild(id);right.appendChild(btn);row.appendChild(label);row.appendChild(right);mqttControllers.appendChild(row)})}
-function renderMqtt(data){const admin=data.softap_admin!==false;mqttStatusValue.textContent=data.mqtt_status||'-';mqttDeviceId.textContent=data.mqtt_device_id||'-';mqttError.textContent=data.mqtt_error?data.mqtt_error:'None';mqttPairing.textContent=data.mqtt_pairing?'Open - count the blinks on the strip':'Closed';renderMqttControllers(data.mqtt_controllers,admin)}
-function applyMqttConfig(data){mqttHost.value=data.mqtt_host||'';if(Number(data.mqtt_port)>0)mqttPort.value=Number(data.mqtt_port);mqttUser.value=data.mqtt_user||'';mqttPass.value='';if(typeof data.mqtt_tls==='boolean')mqttTls.checked=data.mqtt_tls}
-async function saveMqtt(){mqttStatus.textContent='Saving MQTT settings...';const payload={count:Number(configCount.value),ap_ssid:configApSsid.value.trim(),ap_password:'',auto_install_enabled:!!configAutoInstall.checked,mqtt_host:mqttHost.value.trim(),mqtt_port:Math.max(1,Math.min(65535,Number(mqttPort.value)||8883)),mqtt_user:mqttUser.value.trim(),mqtt_pass:mqttPass.value,mqtt_tls:!!mqttTls.checked};const res=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!res.ok)throw new Error(await res.text()||'Failed to save MQTT settings');const data=await res.json();applyStateToUi(data);mqttStatus.textContent=payload.mqtt_host?'MQTT settings saved. The link reconnects in the background.':'MQTT link disabled.'}
-async function unpairController(id){if(!id)return;if(!window.confirm('Unpair '+id+' from this strip?'))return;mqttStatus.textContent='Unpairing '+id+'...';const res=await fetch('/api/mqtt/unpair',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok)throw new Error(data.message||text||'Failed to unpair');mqttStatus.textContent=data.message||'Controller unpaired';loadState().catch(()=>{})}
-function setOtaBusy(busy){otaBtn.disabled=busy;otaFile.disabled=busy;otaBtn.textContent=busy?'Uploading OTA...':'Install From File'}
-function setScheduleEditorDisabled(disabled){scheduleTz.disabled=disabled;saveScheduleBtn.disabled=disabled;scheduleRowEls.forEach((slot)=>{slot.enabled.disabled=disabled;slot.time.disabled=disabled;slot.action.disabled=disabled;slot.days.forEach((cb)=>{cb.disabled=disabled})})}
-function applyAdminGating(data){const admin=data.softap_admin!==false;const adminControls=[configCount,configCountNumber,configApSsid,configApPassword,configAutoInstall,saveConfigBtn,rebootBtn,otaBtn,otaFile,checkUpdateBtn,openMatterWindowBtn,factoryResetBtn,mqttHost,mqttPort,mqttUser,mqttPass,mqttTls,saveMqttBtn];adminControls.forEach((element)=>{element.disabled=!admin});revertBtn.disabled=!admin||!data.revert_available;setScheduleEditorDisabled(!admin)}
-function applyStateToUi(data){const admin=data.softap_admin!==false;effectProfiles=normalizeEffectProfiles(data.effect_profiles);effectColors=normalizeEffectColors(data.effect_colors);selectedEffect=data.effect||'solid';syncConfigCount(data.count);configCount.max=data.max_leds;configCountNumber.max=data.max_leds;configApSsid.value=data.config_ap_ssid||data.ap_ssid||'';configApPassword.value='';if(typeof data.auto_install_enabled==='boolean'){configAutoInstall.checked=data.auto_install_enabled}controlBrightness.value=data.brightness;controlColor.value=data.color||controlColor.value;applyAdminGating(data);refreshOverview(data);refreshFirmwarePanel(data);applyMqttConfig(data);renderMqtt(data);otaStatus.textContent=admin?'Next OTA slot: '+(data.ota_target_partition||'unknown')+'. Upload build/esp32c6_led_web.bin after the first USB flash.':'Connect to the device SoftAP to administer firmware and configuration.';syncEffectControls();updateControlReadout();syncTimer(data.relative_active,data.relative_action,data.relative_remaining_s)}
-async function loadState(){controlStatus.textContent='Loading device state...';const res=await fetch('/api/state');if(!res.ok)throw new Error('Failed to load state');const data=await res.json();applyStateToUi(data);loadSchedule().catch(err=>scheduleStatus.textContent=err.message);controlStatus.textContent='Device state loaded';configStatus.textContent=data.ap_restart_required?'Saved AP config is waiting for a reboot.':'Configuration loaded'}
-let connMisses=0;let connDown=false;
-function showConnDown(msg){if(connDown&&connBanner.textContent===msg)return;connBanner.textContent=msg;connBanner.hidden=false;pageWrap.classList.add('stale');connDown=true}
-function clearConnDown(){if(!connDown)return;connBanner.hidden=true;pageWrap.classList.remove('stale');connDown=false}
-function recoverAfterReboot(){otaInFlight=true;connDown=true;connBanner.textContent='Device is restarting - reconnecting...';connBanner.hidden=false;pageWrap.classList.add('stale');const start=Date.now();const retry=()=>{if(Date.now()-start>90000){connBanner.textContent='Device still unreachable - reload manually.'}else{setTimeout(tick,2000)}};function tick(){fetch('/api/state',{cache:'no-store'}).then((res)=>{if(res.ok){window.location.reload()}else{retry()}}).catch(retry)}setTimeout(tick,2000)}
-async function pollStatus(){if(document.hidden)return;try{const res=await fetch('/api/state',{cache:'no-store'});if(!res.ok)throw new Error('poll status '+res.status);const data=await res.json();connMisses=0;if(!otaInFlight)clearConnDown();applyAdminGating(data);refreshOverview(data);refreshFirmwarePanel(data);renderMqtt(data);reconcileControls(data);syncTimer(data.relative_active,data.relative_action,data.relative_remaining_s);updateScheduleTimeLine(!!data.time_valid,data.now_local)}catch(_){if(otaInFlight)return;connMisses++;if(connMisses>=2)showConnDown('Device unreachable - reconnecting...')}}
-async function saveControl(){controlStatus.textContent='Applying control...';if(liveApplyTimer){clearTimeout(liveApplyTimer);liveApplyTimer=null}liveApplyPending=false;stashEffectControls();const payload=buildControlPayload();const res=await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!res.ok)throw new Error(await res.text()||'Failed to apply control');const data=await res.json();applyStateToUi(data);controlStatus.textContent='Control saved'}
-async function saveConfig(){configStatus.textContent='Saving configuration...';const payload={count:Number(configCount.value),ap_ssid:configApSsid.value.trim(),ap_password:configApPassword.value,auto_install_enabled:!!configAutoInstall.checked};const res=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!res.ok)throw new Error(await res.text()||'Failed to save configuration');const data=await res.json();applyStateToUi(data);configStatus.textContent=data.ap_restart_required?'Configuration saved. Press Reboot to apply the new AP credentials.':'Configuration saved'}
-async function openMatterPairingWindow(){stampUserMsg(matterPairingStatus,'Opening Matter pairing window...');openMatterWindowBtn.disabled=true;const res=await fetch('/api/matter/pairing-window',{method:'POST'});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok)throw new Error(data.message||text||'Failed to open Matter pairing window');stampUserMsg(matterPairingStatus,data.message||'Matter pairing window opened');setTimeout(()=>loadState().catch(err=>stampUserMsg(matterPairingStatus,err.message)),500)}
-function uploadOta(){const file=otaFile.files&&otaFile.files[0];if(!file)return Promise.reject(new Error('Choose a firmware .bin file first'));otaInFlight=true;setOtaBusy(true);otaStatus.textContent='Uploading '+file.name+' ('+file.size+' bytes)...';otaProgress.value=0;otaProgress.hidden=false;return new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();xhr.open('POST','/api/ota');xhr.setRequestHeader('Content-Type','application/octet-stream');xhr.setRequestHeader('X-Filename',file.name);xhr.upload.onprogress=(e)=>{if(e.lengthComputable){otaProgress.value=Math.round(e.loaded/e.total*100)}};xhr.onload=()=>{otaProgress.value=100;otaProgress.hidden=true;const text=xhr.responseText||'';let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(xhr.status<200||xhr.status>=300){otaInFlight=false;reject(new Error(data.message||text||'OTA update failed'));return}otaStatus.textContent=data.message||'Update installed. Device will restart.';actionStatus.textContent='OTA accepted. Reconnect after reboot.';recoverAfterReboot();resolve()};xhr.onerror=()=>{otaProgress.hidden=true;otaInFlight=false;reject(new Error('OTA update failed'))};xhr.send(file)})}
-async function postAction(url,statusEl,confirmText){if(confirmText&&!window.confirm(confirmText))return;otaInFlight=true;statusEl.textContent='Sending command...';const res=await fetch(url,{method:'POST'});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok){otaInFlight=false;throw new Error(data.message||text||'Action failed')}statusEl.textContent=data.message||'Command sent';recoverAfterReboot()}
-async function checkPublishedUpdate(){stampUserMsg(updateStatusLine,'Checking GitHub for the latest release...');const res=await fetch('/api/check-update',{method:'POST'});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok)throw new Error(data.message||text||'Published update check failed');stampUserMsg(updateStatusLine,data.message||'Check queued');setTimeout(()=>loadState().catch(err=>stampUserMsg(updateStatusLine,err.message)),3000)}
-async function installPublishedUpdate(){if(!window.confirm('Install the latest published firmware now? The device will reboot.'))return;stampUserMsg(updateStatusLine,'Queueing install...');otaInFlight=true;installUpdateBtn.disabled=true;const res=await fetch('/api/install-update',{method:'POST'});const text=await res.text();let data={message:text};try{data=JSON.parse(text)}catch(_){ }if(!res.ok){installUpdateBtn.disabled=false;throw new Error(data.message||text||'Install failed')}stampUserMsg(updateStatusLine,data.message||'Install queued');setTimeout(()=>loadState().catch(err=>stampUserMsg(updateStatusLine,err.message)),3000)}
-mainTabButtons.forEach((button)=>button.addEventListener('click',()=>switchMainTab(button.dataset.mainTab)));
-configCount.addEventListener('input',()=>syncConfigCount(configCount.value));
-configCountNumber.addEventListener('input',()=>{const max=Number(configCount.max);let v=Number(configCountNumber.value||1);v=Math.max(1,Math.min(max,v));syncConfigCount(v)});
-controlBrightness.addEventListener('input',()=>{updateControlReadout();scheduleLiveApply()});controlColor.addEventListener('input',()=>{updateControlReadout();scheduleLiveApply()});
-effectTabButtons.forEach((button)=>button.addEventListener('click',()=>{stashEffectControls();selectedEffect=button.dataset.effectTab;syncEffectControls();updateControlReadout();scheduleLiveApply()}));
-effectParamRows.forEach((slot)=>slot.input.addEventListener('input',()=>{stashEffectControls();updateControlReadout();scheduleLiveApply()}));
-effectColor.addEventListener('input',()=>{effectColors[selectedEffect]=normalizeHexColor(effectColor.value,getSelectedEffectColor());updateControlReadout();scheduleLiveApply()});
-saveControlBtn.addEventListener('click',()=>saveControl().catch(err=>controlStatus.textContent=err.message));
-saveConfigBtn.addEventListener('click',()=>saveConfig().catch(err=>configStatus.textContent=err.message));
-saveMqttBtn.addEventListener('click',()=>saveMqtt().catch(err=>mqttStatus.textContent=err.message));
-timerStartBtn.addEventListener('click',()=>startTimer().catch(err=>timerStatus.textContent=err.message));
-timerCancelBtn.addEventListener('click',()=>cancelTimer().catch(err=>timerStatus.textContent=err.message));
-saveScheduleBtn.addEventListener('click',()=>saveSchedule().catch(err=>scheduleStatus.textContent=err.message));
-setInterval(timerLocalTick,1000);
-document.getElementById('reloadBtn').addEventListener('click',()=>loadState().catch(err=>controlStatus.textContent=err.message));
-otaBtn.addEventListener('click',()=>uploadOta().catch(err=>{otaStatus.textContent=err.message;setOtaBusy(false)}));
-checkUpdateBtn.addEventListener('click',()=>checkPublishedUpdate().catch(err=>stampUserMsg(updateStatusLine,err.message)));
-installUpdateBtn.addEventListener('click',()=>installPublishedUpdate().catch(err=>stampUserMsg(updateStatusLine,err.message)));
-openMatterWindowBtn.addEventListener('click',()=>openMatterPairingWindow().catch(err=>{stampUserMsg(matterPairingStatus,err.message);openMatterWindowBtn.disabled=false}));
-document.addEventListener('visibilitychange',()=>{if(!document.hidden)pollStatus()});setInterval(pollStatus,5000);
-rebootBtn.addEventListener('click',()=>postAction('/api/reboot',configStatus,'Reboot the device now?').catch(err=>configStatus.textContent=err.message));
-revertBtn.addEventListener('click',()=>postAction('/api/revert',actionStatus,'Revert to the previous firmware slot and reboot?').catch(err=>actionStatus.textContent=err.message));
-factoryResetBtn.addEventListener('click',()=>postAction('/api/factory-reset',actionStatus,'Factory reset will erase Matter pairing, Wi-Fi AP config, and saved LED settings. Continue?').catch(err=>actionStatus.textContent=err.message));
-effectProfiles=buildDefaultEffectProfiles();effectColors=buildDefaultEffectColors();syncEffectControls();buildScheduleRows();loadState().catch(err=>{controlStatus.textContent=err.message;configStatus.textContent=err.message;updateControlReadout()});
-</script>
-</body>
-</html>
-)HTML";
+// The web UI, embedded gzip-compressed from main/web/index.html by
+// main/CMakeLists.txt. Only the compressed representation is stored: keeping
+// an uncompressed copy as well would cost more flash than the raw literal
+// this replaced, which was the point of compressing it. root_get_handler()
+// therefore has to negotiate, and a client that refuses gzip gets a 406
+// rather than a page -- see main/model/http_encoding.h.
+extern const uint8_t index_html_gz_start[] asm("_binary_index_html_gz_start");
+extern const uint8_t index_html_gz_end[] asm("_binary_index_html_gz_end");
 
 static inline uint8_t clamp_u8(int value)
 {
@@ -3343,10 +2877,48 @@ static esp_err_t send_state_json(httpd_req_t *req)
     return err;
 }
 
+// Serves the embedded page. The decoded bytes are identical to the literal
+// this replaced; only the transfer coding changed.
+//
+// The 406 branch is not a convenience: the uncompressed page is not on the
+// device at all, so a client that forbids gzip genuinely cannot be served it.
+// Every browser and captive-portal agent accepts gzip, and a request carrying
+// no Accept-Encoding at all counts as accepting it (RFC 9110 12.5.3), so this
+// path needs a deliberately crafted request to reach.
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
+    char accept[HTTP_ACCEPT_ENCODING_MAX];
+    bool gzip_ok;
+
+    size_t len = httpd_req_get_hdr_value_len(req, "Accept-Encoding");
+    if (len == 0) {
+        // Absent field. Note this is NOT the same as an empty value, which
+        // would mean identity-only -- httpd reports both as length 0, so treat
+        // the ambiguous case the permissive way the RFC prescribes for absence.
+        gzip_ok = http_accepts_gzip(nullptr);
+    } else if (len >= sizeof(accept)) {
+        gzip_ok = http_accepts_gzip_truncated();
+    } else if (httpd_req_get_hdr_value_str(req, "Accept-Encoding", accept,
+                                           sizeof(accept)) == ESP_OK) {
+        gzip_ok = http_accepts_gzip(accept);
+    } else {
+        gzip_ok = http_accepts_gzip_truncated();
+    }
+
+    if (!gzip_ok) {
+        ESP_LOGW(TAG, "GET / refused gzip; the page is stored compressed only");
+        httpd_resp_set_status(req, "406 Not Acceptable");
+        httpd_resp_set_type(req, "text/plain; charset=utf-8");
+        return httpd_resp_sendstr(
+            req, "This page is stored gzip-compressed to fit the flash "
+                 "budget, and no uncompressed copy exists on the device. "
+                 "Retry with 'Accept-Encoding: gzip' (curl --compressed).\n");
+    }
+
+    const size_t gz_len = (size_t) (index_html_gz_end - index_html_gz_start);
     httpd_resp_set_type(req, "text/html; charset=utf-8");
-    return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+    return httpd_resp_send(req, (const char *) index_html_gz_start, gz_len);
 }
 
 static esp_err_t captive_redirect_handler(httpd_req_t *req)

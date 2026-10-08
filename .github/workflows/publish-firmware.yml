@@ -76,6 +76,51 @@ jobs:
               || { echo "::error::main/model/$m.cpp has no host test module registered in test/host/run_tests.sh"; exit 1; }
           done
 
+      # Guards the asset the flash budget depends on. Needs no toolchain, so it
+      # runs before the ~7-minute build.
+      - name: Web asset guard
+        shell: bash
+        env:
+          MIN_RECLAIM_BYTES: "44000"
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import gzip, io, os, pathlib, sys
+
+          asset = pathlib.Path("main/web/index.html")
+          raw = asset.read_bytes()
+
+          # A CRLF working copy changes both the payload and what the browser is
+          # served, so a Windows checkout must not be able to produce a different
+          # build from an unchanged tree. .gitattributes pins this; verify it.
+          if b"\r\n" in raw:
+              raise SystemExit(f"{asset}: CRLF line endings; .gitattributes should pin eol=lf")
+
+          buf = io.BytesIO()
+          with gzip.GzipFile(filename="", fileobj=buf, mode="wb",
+                             compresslevel=9, mtime=0) as out:
+              out.write(raw)
+          payload = buf.getvalue()
+          if gzip.decompress(payload) != raw:
+              raise SystemExit("gzip round-trip did not reproduce the asset")
+
+          reclaim = len(raw) - len(payload)
+          floor = int(os.environ["MIN_RECLAIM_BYTES"])
+          print(f"web asset: {len(raw):,} -> {len(payload):,} bytes, "
+                f"reclaiming {reclaim:,} (floor {floor:,})")
+
+          # The programme's solvency rests on this one number: the refactor's
+          # per-package growth ceilings are funded by it. If the page grows
+          # enough to erode the reclaim, that is a budget decision, not
+          # something to discover later in a size gate.
+          if reclaim < floor:
+              raise SystemExit(
+                  f"reclaim fell to {reclaim:,}, below the {floor:,}-byte floor.\n"
+                  "The page grew. Either shrink it or lower the floor deliberately, "
+                  "with a reason, and reconcile the headroom ledger."
+              )
+          PY
+
       - name: Build firmware
         shell: bash
         run: |

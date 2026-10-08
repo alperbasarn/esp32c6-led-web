@@ -6,3 +6,9 @@
 *.yaml text eol=lf
 Kconfig* text eol=lf
 sdkconfig.defaults text eol=lf
+
+# The embedded web asset. `* text=auto` above would hand a Windows checkout a
+# CRLF working copy, which changes both the gzip payload and the bytes served
+# to the browser -- a platform-dependent build from an unchanged tree. Pin it.
+main/web/index.html text eol=lf
+*.py text eol=lf
